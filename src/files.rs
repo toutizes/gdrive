@@ -9,6 +9,7 @@ pub mod list;
 pub mod mkdir;
 pub mod mv;
 pub mod rename;
+pub mod tasks;
 pub mod update;
 pub mod upload;
 

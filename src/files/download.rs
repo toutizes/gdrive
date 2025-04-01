@@ -4,6 +4,7 @@ use crate::common::file_tree_drive::{FileTreeDrive, Folder};
 use crate::common::hub_helper;
 use crate::common::md5_writer::Md5Writer;
 use crate::files;
+use crate::files::tasks::{CopyTask, TaskManager, TaskStatus};
 use crate::hub::Hub;
 use async_recursion::async_recursion;
 use futures::stream::StreamExt;
@@ -20,6 +21,7 @@ use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct Config {
     pub file_id: String,
@@ -27,6 +29,7 @@ pub struct Config {
     pub follow_shortcuts: bool,
     pub download_directories: bool,
     pub destination: Destination,
+    pub workers: usize,
 }
 
 impl Config {
@@ -75,7 +78,7 @@ pub enum ExistingFileAction {
 
 #[async_recursion]
 pub async fn download(config: Config) -> Result<(), Error> {
-    let hub = hub_helper::get_hub().await.map_err(Error::Hub)?;
+    let hub = Arc::new(hub_helper::get_hub().await.map_err(Error::Hub)?);
 
     let file = files::info::get_file(&hub, &config.file_id)
         .await
@@ -105,7 +108,7 @@ pub async fn download(config: Config) -> Result<(), Error> {
 }
 
 pub async fn download_regular(
-    hub: &Hub,
+    hub: &Arc<Hub>,
     file: &google_drive3::api::File,
     config: &Config,
 ) -> Result<(), Error> {
@@ -150,7 +153,7 @@ fn create_dir_if_needed(path: &PathBuf) -> Result<usize, Error> {
 }
 
 pub async fn download_directory(
-    hub: &Hub,
+    hub: &Arc<Hub>,
     file: &google_drive3::api::File,
     config: &Config,
 ) -> Result<(), Error> {
@@ -161,8 +164,7 @@ pub async fn download_directory(
     let tree_info = tree.info();
     let mut num_created_directories: usize = 0;
     let mut num_deleted_files: usize = 0;
-    let mut num_downloaded_files: usize = 0;
-    let mut total_bytes: usize = 0;
+    let mut tm = TaskManager::new(config.workers);
 
     println!(
         "Found {} files in {} directories with a total size of {}",
@@ -187,30 +189,57 @@ pub async fn download_directory(
                 continue;
             }
 
-            let body = download_file(&hub, &file.drive_id)
-                .await
-                .map_err(Error::DownloadFile)?;
-
-            println!("Downloading file '{}'", file_path.display());
-            total_bytes += save_body_to_file(body, &abs_file_path, file.md5.clone()).await?;
-            num_downloaded_files += 1;
+            let t: CopyTask = CopyTask::new(
+                hub.clone(),
+                /*download*/ true,
+                file.drive_id.clone(),
+                abs_file_path.clone(),
+                file.md5.clone(),
+            );
+            tm.add_task(t);
         }
+        // NOTE: this runs synchronously, not like the copies.
         if config.existing_file_action == ExistingFileAction::SyncLocal {
             num_deleted_files += delete_extra_local_files(&folder, abs_folder_path.clone())
                 .await
                 .map_err(|err| Error::ReadDirectory(abs_folder_path.clone(), err))?;
         }
     }
-
-    println!(
-        "Downloaded {} files in {} directories with a total size of {}, deleted {} local files",
-        num_downloaded_files,
-        num_created_directories,
-        human_bytes(total_bytes as f64),
-        num_deleted_files
-    );
+    report_stats(tm.wait().await, num_deleted_files, num_created_directories);
 
     Ok(())
+}
+
+pub fn report_stats(
+    tasks: Vec<Arc<CopyTask>>,
+    num_deleted_files: usize,
+    num_created_directories: usize,
+) {
+    let mut num_success = 0;
+    let mut num_failures = 0;
+    let mut total_bytes = 0;
+
+    for task in tasks {
+        let status_guard = task.status.lock().unwrap();
+        match *status_guard {
+            TaskStatus::Pending => {}
+            TaskStatus::Completed(file_bytes) => {
+                num_success += 1;
+                total_bytes += file_bytes;
+            }
+            TaskStatus::Failed(_) => {
+                num_failures += 1;
+            }
+        };
+    }
+    println!(
+        "Download finished.\n files: {}\n directories: {}\n bytes: {}\n deletions: {}\n errors: {}",
+        num_success,
+        num_created_directories,
+        human_bytes(total_bytes as f64),
+        num_deleted_files,
+        num_failures
+    );
 }
 
 pub async fn delete_extra_local_files(

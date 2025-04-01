@@ -179,6 +179,10 @@ enum FileCommand {
         #[arg(long, value_name = "PATH")]
         destination: Option<PathBuf>,
 
+        /// Number of workers to use for downloading files in parallel
+        #[arg(long)]
+        workers: Option<usize>,
+
         /// Write file to stdout
         #[arg(long)]
         stdout: bool,
@@ -502,6 +506,7 @@ async fn main() {
                     follow_shortcuts,
                     recursive,
                     destination,
+                    workers,
                     stdout,
                 } => {
                     let existing_file_action = if sync {
@@ -526,6 +531,7 @@ async fn main() {
                         follow_shortcuts,
                         download_directories: recursive,
                         destination: dst,
+                        workers: workers.unwrap_or(1),
                     })
                     .await
                     .unwrap_or_else(handle_error)
