@@ -133,6 +133,22 @@ pub async fn download_regular(
     Ok(())
 }
 
+fn create_dir_if_needed(path: &PathBuf) -> Result<usize, Error> {
+    // Only create the directory if it doesn't exist
+    if !path.exists() {
+        println!("Creating directory {}", path.display());
+        fs::create_dir_all(&path).map_err(|err| Error::CreateDirectory(path.clone(), err))?;
+    } else {
+        let file_type = fs::metadata(&path)
+            .map_err(|err| Error::CreateDirectory(path.clone(), err))?
+            .file_type();
+        if !file_type.is_dir() {
+            return Err(Error::IsNotDirectory(path.display().to_string()));
+        }
+    }
+    Ok(1)
+}
+
 pub async fn download_directory(
     hub: &Hub,
     file: &google_drive3::api::File,
@@ -143,7 +159,10 @@ pub async fn download_directory(
         .map_err(Error::CreateFileTree)?;
 
     let tree_info = tree.info();
-    let mut num_deleted_files : usize = 0;
+    let mut num_created_directories: usize = 0;
+    let mut num_deleted_files: usize = 0;
+    let mut num_downloaded_files: usize = 0;
+    let mut total_bytes: usize = 0;
 
     println!(
         "Found {} files in {} directories with a total size of {}",
@@ -158,9 +177,7 @@ pub async fn download_directory(
         let folder_path = folder.relative_path();
         let abs_folder_path = root_path.join(&folder_path);
 
-        println!("Creating directory {}", folder_path.display());
-        fs::create_dir_all(&abs_folder_path)
-            .map_err(|err| Error::CreateDirectory(abs_folder_path.clone(), err))?;
+        num_created_directories += create_dir_if_needed(&abs_folder_path)?;
 
         for file in folder.files() {
             let file_path = file.relative_path();
@@ -175,21 +192,21 @@ pub async fn download_directory(
                 .map_err(Error::DownloadFile)?;
 
             println!("Downloading file '{}'", file_path.display());
-            save_body_to_file(body, &abs_file_path, file.md5.clone()).await?;
+            total_bytes += save_body_to_file(body, &abs_file_path, file.md5.clone()).await?;
+            num_downloaded_files += 1;
         }
         if config.existing_file_action == ExistingFileAction::SyncLocal {
-            num_deleted_files +=
-                delete_extra_local_files(&folder, abs_folder_path.clone())
-                    .await
-                    .map_err(|err| Error::ReadDirectory(abs_folder_path.clone(), err))?;
+            num_deleted_files += delete_extra_local_files(&folder, abs_folder_path.clone())
+                .await
+                .map_err(|err| Error::ReadDirectory(abs_folder_path.clone(), err))?;
         }
     }
 
     println!(
         "Downloaded {} files in {} directories with a total size of {}, deleted {} local files",
-        tree_info.file_count,
-        tree_info.folder_count,
-        human_bytes(tree_info.total_file_size as f64),
+        num_downloaded_files,
+        num_created_directories,
+        human_bytes(total_bytes as f64),
         num_deleted_files
     );
 
@@ -209,8 +226,8 @@ pub async fn delete_extra_local_files(
 
     for entry in fs::read_dir(&abs_folder_path)? {
         let valid_entry = entry?;
-        let file_type = valid_entry.file_type();
-        if file_type?.is_file() {
+        let file_type = valid_entry.file_type()?;
+        if file_type.is_file() || file_type.is_symlink() {
             let relative_file_name = valid_entry.file_name().to_string_lossy().to_string();
             if !drive_files.contains(&relative_file_name) {
                 let absolute_file_path = valid_entry.path();
@@ -218,7 +235,7 @@ pub async fn delete_extra_local_files(
                 fs::remove_file(absolute_file_path)?;
                 num_deleted_files += 1;
             }
-            // We should also delete symlinks and directories (recursively)
+            // We should also delete directories recursively
             // Maybe a stronger prompt for allowing deletion of directories?
             // like --full-sync ?
         }
@@ -248,6 +265,7 @@ pub enum Error {
     MissingFileName,
     FileExists(PathBuf),
     IsDirectory(String),
+    IsNotDirectory(String),
     Md5Mismatch { expected: String, actual: String },
     CreateFile(io::Error),
     CreateDirectory(PathBuf, io::Error),
@@ -282,6 +300,11 @@ impl Display for Error {
             Error::IsDirectory(name) => write!(
                 f,
                 "'{}' is a directory, use --recursive to download directories",
+                name
+            ),
+            Error::IsNotDirectory(name) => write!(
+                f,
+                "'{}' exists and is not a directory, use --sync to replace",
                 name
             ),
             Error::Md5Mismatch { expected, actual } => {
@@ -342,25 +365,29 @@ pub async fn save_body_to_file(
     mut body: hyper::Body,
     file_path: &PathBuf,
     expected_md5: Option<String>,
-) -> Result<(), Error> {
+) -> Result<usize, Error> {
     // Create temporary file
     let tmp_file_path = file_path.with_extension("incomplete");
     let file = File::create(&tmp_file_path).map_err(Error::CreateFile)?;
 
     // Wrap file in writer that calculates md5
     let mut writer = Md5Writer::new(file);
+    let mut written_bytes: usize = 0;
 
     // Read chunks from stream and write to file
     while let Some(chunk_result) = body.next().await {
         let chunk = chunk_result.map_err(Error::ReadChunk)?;
         writer.write_all(&chunk).map_err(Error::WriteChunk)?;
+        written_bytes += chunk.len();
     }
 
     // Check md5
     err_if_md5_mismatch(expected_md5, writer.md5())?;
 
     // Rename temporary file to final file
-    fs::rename(&tmp_file_path, &file_path).map_err(Error::RenameFile)
+    fs::rename(&tmp_file_path, &file_path).map_err(Error::RenameFile)?;
+
+    Ok(written_bytes)
 }
 
 // TODO: move to common
