@@ -125,7 +125,7 @@ enum FileCommand {
         #[arg(long, default_value_t = 30)]
         max: usize,
 
-        /// Query. See https://developers.google.com/drive/search-parameters
+        /// Query. See https://developers.google.com/workspace/drive/api/guides/ref-search-terms
         #[arg(long, default_value_t = ListQuery::default())]
         query: ListQuery,
 
@@ -162,6 +162,10 @@ enum FileCommand {
         /// Overwrite existing files and folders
         #[arg(long)]
         overwrite: bool,
+
+        /// Overwrite existing files and folders, delete local files that are not on drive
+        #[arg(long)]
+        sync: bool,
 
         /// Follow shortcut and download target file (does not work with recursive download)
         #[arg(long)]
@@ -494,12 +498,15 @@ async fn main() {
                 FileCommand::Download {
                     file_id,
                     overwrite,
+                    sync,
                     follow_shortcuts,
                     recursive,
                     destination,
                     stdout,
                 } => {
-                    let existing_file_action = if overwrite {
+                    let existing_file_action = if sync {
+                        files::download::ExistingFileAction::SyncLocal
+                    } else if overwrite {
                         files::download::ExistingFileAction::Overwrite
                     } else {
                         files::download::ExistingFileAction::Abort

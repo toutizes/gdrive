@@ -1,6 +1,6 @@
 use crate::common::drive_file;
 use crate::common::file_tree_drive;
-use crate::common::file_tree_drive::FileTreeDrive;
+use crate::common::file_tree_drive::{FileTreeDrive, Folder};
 use crate::common::hub_helper;
 use crate::common::md5_writer::Md5Writer;
 use crate::files;
@@ -9,6 +9,7 @@ use async_recursion::async_recursion;
 use futures::stream::StreamExt;
 use google_drive3::hyper;
 use human_bytes::human_bytes;
+use std::collections::HashSet;
 use std::error;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -69,6 +70,7 @@ pub enum Destination {
 pub enum ExistingFileAction {
     Abort,
     Overwrite,
+    SyncLocal,
 }
 
 #[async_recursion]
@@ -141,6 +143,7 @@ pub async fn download_directory(
         .map_err(Error::CreateFileTree)?;
 
     let tree_info = tree.info();
+    let mut num_deleted_files : usize = 0;
 
     println!(
         "Found {} files in {} directories with a total size of {}",
@@ -157,7 +160,7 @@ pub async fn download_directory(
 
         println!("Creating directory {}", folder_path.display());
         fs::create_dir_all(&abs_folder_path)
-            .map_err(|err| Error::CreateDirectory(abs_folder_path, err))?;
+            .map_err(|err| Error::CreateDirectory(abs_folder_path.clone(), err))?;
 
         for file in folder.files() {
             let file_path = file.relative_path();
@@ -174,16 +177,54 @@ pub async fn download_directory(
             println!("Downloading file '{}'", file_path.display());
             save_body_to_file(body, &abs_file_path, file.md5.clone()).await?;
         }
+        if config.existing_file_action == ExistingFileAction::SyncLocal {
+            num_deleted_files +=
+                delete_extra_local_files(&folder, abs_folder_path.clone())
+                    .await
+                    .map_err(|err| Error::ReadDirectory(abs_folder_path.clone(), err))?;
+        }
     }
 
     println!(
-        "Downloaded {} files in {} directories with a total size of {}",
+        "Downloaded {} files in {} directories with a total size of {}, deleted {} local files",
         tree_info.file_count,
         tree_info.folder_count,
-        human_bytes(tree_info.total_file_size as f64)
+        human_bytes(tree_info.total_file_size as f64),
+        num_deleted_files
     );
 
     Ok(())
+}
+
+pub async fn delete_extra_local_files(
+    folder: &Folder,
+    abs_folder_path: PathBuf,
+) -> Result<usize, io::Error> {
+    let mut drive_files: HashSet<String> = HashSet::new();
+    for file in folder.files() {
+        drive_files.insert(file.name);
+    }
+
+    let mut num_deleted_files: usize = 0;
+
+    for entry in fs::read_dir(&abs_folder_path)? {
+        let valid_entry = entry?;
+        let file_type = valid_entry.file_type();
+        if file_type?.is_file() {
+            let relative_file_name = valid_entry.file_name().to_string_lossy().to_string();
+            if !drive_files.contains(&relative_file_name) {
+                let absolute_file_path = valid_entry.path();
+                println!("Deleting: {:?}", absolute_file_path);
+                fs::remove_file(absolute_file_path)?;
+                num_deleted_files += 1;
+            }
+            // We should also delete symlinks and directories (recursively)
+            // Maybe a stronger prompt for allowing deletion of directories?
+            // like --full-sync ?
+        }
+    }
+
+    Ok(num_deleted_files)
 }
 
 pub async fn download_file(hub: &Hub, file_id: &str) -> Result<hyper::Body, google_drive3::Error> {
@@ -213,6 +254,7 @@ pub enum Error {
     CopyFile(io::Error),
     RenameFile(io::Error),
     ReadChunk(hyper::Error),
+    ReadDirectory(PathBuf, io::Error),
     WriteChunk(io::Error),
     CreateFileTree(file_tree_drive::Error),
     DestinationPathDoesNotExist(PathBuf),
@@ -258,6 +300,9 @@ impl Display for Error {
                 err
             ),
             Error::CopyFile(err) => write!(f, "Failed to copy file: {}", err),
+            Error::ReadDirectory(path, err) => {
+                write!(f, "Failed to read directory '{}': {}", path.display(), err)
+            }
             Error::RenameFile(err) => write!(f, "Failed to rename file: {}", err),
             Error::ReadChunk(err) => write!(f, "Failed read from stream: {}", err),
             Error::WriteChunk(err) => write!(f, "Failed write to file: {}", err),
