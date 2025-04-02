@@ -4,9 +4,10 @@ use crate::common::file_tree_drive::{FileTreeDrive, Folder};
 use crate::common::hub_helper;
 use crate::common::md5_writer::Md5Writer;
 use crate::files;
-use crate::files::tasks::{CopyTask, TaskManager, TaskStatus};
+use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
 use async_recursion::async_recursion;
+use async_trait::async_trait;
 use futures::stream::StreamExt;
 use google_drive3::hyper;
 use human_bytes::human_bytes;
@@ -21,7 +22,7 @@ use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct Config {
     pub file_id: String,
@@ -76,6 +77,67 @@ pub enum ExistingFileAction {
     SyncLocal,
 }
 
+// Task for copying a file.
+pub struct DownloadTask {
+    hub: Arc<Hub>,
+    driveid: String,
+    // If not specified, download the file to stdout
+    filepath: Option<PathBuf>,
+    md5: Option<String>,
+    pub status: Mutex<DriveTaskStatus>,
+}
+
+impl DownloadTask {
+    pub fn new(
+        hub: Arc<Hub>,
+        driveid: String,
+        filepath: Option<PathBuf>,
+        md5: Option<String>,
+    ) -> Self {
+        Self {
+            hub,
+            driveid,
+            filepath,
+            status: Mutex::new(DriveTaskStatus::Pending),
+            md5,
+        }
+    }
+
+    pub async fn download(&self) -> Result<(), Error> {
+        println!("Downloading {:?}", self.filepath);
+        let body = download_file(&self.hub, &self.driveid)
+            .await
+            .map_err(Error::DownloadFile)?;
+        match &self.filepath {
+            Some(actual_path) => {
+                let file_bytes = save_body_to_file(body, &actual_path, self.md5.clone()).await?;
+                *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
+            }
+            None => {
+                save_body_to_stdout(body).await?;
+            }
+        };
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DriveTask for DownloadTask {
+    fn get_status(&self) -> DriveTaskStatus {
+        self.status.lock().unwrap().clone()
+    }
+
+    async fn process(&self) {
+        let result = self.download().await;
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                *(self.status.lock().unwrap()) = DriveTaskStatus::Failed(e.to_string());
+            }
+        }
+    }
+}
+
 #[async_recursion]
 pub async fn download(config: Config) -> Result<(), Error> {
     let hub = Arc::new(hub_helper::get_hub().await.map_err(Error::Hub)?);
@@ -112,14 +174,10 @@ pub async fn download_regular(
     file: &google_drive3::api::File,
     config: &Config,
 ) -> Result<(), Error> {
-    let body = download_file(&hub, &config.file_id)
-        .await
-        .map_err(Error::DownloadFile)?;
-
     match &config.destination {
         Destination::Stdout => {
-            // fmt
-            save_body_to_stdout(body).await?;
+            let task = DownloadTask::new(hub.clone(), config.file_id.clone(), None, None);
+            task.process().await;
         }
 
         _ => {
@@ -127,9 +185,13 @@ pub async fn download_regular(
             let root_path = config.canonical_destination_root()?;
             let abs_file_path = root_path.join(&file_name);
 
-            println!("Downloading {}", file_name);
-            save_body_to_file(body, &abs_file_path, file.md5_checksum.clone()).await?;
-            println!("Successfully downloaded {}", file_name);
+            let task = DownloadTask::new(
+                hub.clone(),
+                config.file_id.clone(),
+                Some(abs_file_path.clone()),
+                file.md5_checksum.clone(),
+            );
+            task.process().await;
         }
     }
 
@@ -189,14 +251,13 @@ pub async fn download_directory(
                 continue;
             }
 
-            let t: CopyTask = CopyTask::new(
+            let t: DownloadTask = DownloadTask::new(
                 hub.clone(),
-                /*download*/ true,
                 file.drive_id.clone(),
-                abs_file_path.clone(),
+                Some(abs_file_path.clone()),
                 file.md5.clone(),
             );
-            tm.add_task(t);
+            tm.add_task(Box::new(t));
         }
         // NOTE: this runs synchronously, not like the copies.
         if config.existing_file_action == ExistingFileAction::SyncLocal {
@@ -211,7 +272,7 @@ pub async fn download_directory(
 }
 
 pub fn report_stats(
-    tasks: Vec<Arc<CopyTask>>,
+    tasks: Vec<Arc<Box<dyn DriveTask + Sync + Send>>>,
     num_deleted_files: usize,
     num_created_directories: usize,
 ) {
@@ -220,14 +281,14 @@ pub fn report_stats(
     let mut total_bytes = 0;
 
     for task in tasks {
-        let status_guard = task.status.lock().unwrap();
-        match *status_guard {
-            TaskStatus::Pending => {}
-            TaskStatus::Completed(file_bytes) => {
+        let status = task.get_status();
+        match status {
+            DriveTaskStatus::Pending => {}
+            DriveTaskStatus::Completed(file_bytes) => {
                 num_success += 1;
                 total_bytes += file_bytes;
             }
-            TaskStatus::Failed(_) => {
+            DriveTaskStatus::Failed(_) => {
                 num_failures += 1;
             }
         };

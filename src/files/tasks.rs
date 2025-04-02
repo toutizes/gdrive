@@ -1,74 +1,21 @@
-use crate::files::download::{download_file, save_body_to_file, Error};
-use crate::hub::Hub;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use async_trait::async_trait;
+use std::sync::Arc;
 
-#[derive(Debug)]
-pub enum TaskStatus {
+#[derive(Debug, Clone)]
+pub enum DriveTaskStatus {
     Pending,
     Completed(usize),
-    Failed(Error),
+    Failed(String),
 }
 
-pub struct CopyTask {
-    hub: Arc<Hub>,
-    download: bool,
-    driveid: String,
-    filepath: PathBuf,
-    md5: Option<String>,
-    pub status: Mutex<TaskStatus>,
-}
-
-impl CopyTask {
-    pub fn new(
-        hub: Arc<Hub>,
-        download: bool,
-        driveid: String,
-        filepath: PathBuf,
-        md5: Option<String>,
-    ) -> Self {
-        Self {
-            hub,
-            download,
-            driveid,
-            filepath,
-            status: Mutex::new(TaskStatus::Pending),
-            md5,
-        }
-    }
-
-    pub async fn process(&self) {
-        let result: Result<(), Error> = if self.download {
-            self.download().await
-        } else {
-            self.upload().await
-        };
-
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                *(self.status.lock().unwrap()) = TaskStatus::Failed(e);
-            }
-        }
-    }
-
-    pub async fn download(&self) -> Result<(), Error> {
-        println!("Downloading {:?}", self.filepath);
-        let body = download_file(&self.hub, &self.driveid)
-            .await
-            .map_err(Error::DownloadFile)?;
-        let file_bytes = save_body_to_file(body, &self.filepath, self.md5.clone()).await?;
-        *(self.status.lock().unwrap()) = TaskStatus::Completed(file_bytes);
-        Ok(())
-    }
-
-    pub async fn upload(&self) -> Result<(), Error> {
-        Ok(())
-    }
+#[async_trait]
+pub trait DriveTask {
+    async fn process(&self);
+    fn get_status(&self) -> DriveTaskStatus;
 }
 
 pub struct TaskManager {
-    tasks: Vec<Arc<CopyTask>>,
+    tasks: Vec<Arc<Box<dyn DriveTask + Send + Sync>>>,
     task_handles: Vec<tokio::task::JoinHandle<()>>,
     semaphore: Arc<tokio::sync::Semaphore>,
 }
@@ -82,9 +29,8 @@ impl TaskManager {
         }
     }
 
-    pub fn add_task(&mut self, task: CopyTask) {
+    pub fn add_task(&mut self, task: Box<dyn DriveTask + Sync + Send>) {
         let task_arc = Arc::new(task);
-        *(task_arc.status.lock().unwrap()) = TaskStatus::Pending;
         self.tasks.push(Arc::clone(&task_arc));
 
         let task_clone = Arc::clone(&task_arc);
@@ -94,8 +40,9 @@ impl TaskManager {
             let _permit = match semaphore_clone.acquire().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    eprintln!("Semaphore closed for task: {:?}", task_clone.filepath);
-                    return; // Semaphore closed, cannot proceed
+                    // Happens if we close the sempahore, which we do not. 
+                    eprintln!("Semaphore closed for task");
+                    return; 
                 }
             };
             task_clone.process().await;
@@ -103,7 +50,7 @@ impl TaskManager {
         self.task_handles.push(handle);
     }
 
-    pub async fn wait(&mut self) -> Vec<Arc<CopyTask>> {
+    pub async fn wait(&mut self) -> Vec<Arc<Box<dyn DriveTask + Sync + Send >>> {
         futures::future::join_all(self.task_handles.drain(..)).await;
         self.tasks.clone()
     }
