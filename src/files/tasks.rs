@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc,Mutex};
 
 #[derive(Debug, Clone)]
 pub enum DriveTaskStatus {
@@ -15,23 +15,23 @@ pub trait DriveTask {
 }
 
 pub struct TaskManager {
-    tasks: Vec<Arc<Box<dyn DriveTask + Send + Sync>>>,
-    task_handles: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Mutex<Vec<Arc<Box<dyn DriveTask + Send + Sync>>>>,
+    task_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl TaskManager {
     pub fn new(num_workers: usize) -> Self {
         Self {
-            tasks: Vec::new(),
-            task_handles: Vec::new(),
+            tasks: Mutex::new(Vec::new()),
+            task_handles: Mutex::new(Vec::new()),
             semaphore: Arc::new(tokio::sync::Semaphore::new(num_workers)),
         }
     }
 
-    pub fn add_task(&mut self, task: Box<dyn DriveTask + Sync + Send>) {
+    pub fn add_task(&self, task: Box<dyn DriveTask + Sync + Send>) {
         let task_arc = Arc::new(task);
-        self.tasks.push(Arc::clone(&task_arc));
+        self.tasks.lock().unwrap().push(Arc::clone(&task_arc));
 
         let task_clone = Arc::clone(&task_arc);
         let semaphore_clone = Arc::clone(&self.semaphore);
@@ -40,18 +40,30 @@ impl TaskManager {
             let _permit = match semaphore_clone.acquire().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    // Happens if we close the sempahore, which we do not. 
+                    // Happens if we close the sempahore, which we do not.
                     eprintln!("Semaphore closed for task");
-                    return; 
+                    return;
                 }
             };
             task_clone.process().await;
         });
-        self.task_handles.push(handle);
+        self.task_handles.lock().unwrap().push(handle);
     }
 
-    pub async fn wait(&mut self) -> Vec<Arc<Box<dyn DriveTask + Sync + Send >>> {
-        futures::future::join_all(self.task_handles.drain(..)).await;
-        self.tasks.clone()
+    pub async fn wait(&self) -> Vec<Arc<Box<dyn DriveTask + Sync + Send>>> {
+        loop {
+            let mut remaining_handles = Vec::new();
+            {
+                // Lock while listing the remaining tasks.
+                remaining_handles.extend(self.task_handles.lock().unwrap().drain(..));
+                if remaining_handles.is_empty() {
+                    break;
+                }
+            }
+
+            futures::future::join_all(remaining_handles.drain(..)).await;
+        }
+
+        self.tasks.lock().unwrap().clone()
     }
 }

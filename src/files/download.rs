@@ -226,7 +226,7 @@ pub async fn download_directory(
     let tree_info = tree.info();
     let mut num_created_directories: usize = 0;
     let mut num_deleted_files: usize = 0;
-    let mut tm = TaskManager::new(config.workers);
+    let tm = TaskManager::new(config.workers);
 
     println!(
         "Found {} files in {} directories with a total size of {}",
