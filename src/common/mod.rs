@@ -1,8 +1,10 @@
 pub mod account_archive;
 pub mod delegate;
 pub mod drive_file;
+pub mod drive_names;
 pub mod drive_tree;
 pub mod empty_file;
+pub mod error;
 pub mod file_info;
 pub mod file_tree;
 pub mod file_tree_drive;
