@@ -1,3 +1,4 @@
+
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
 use crate::common::hub_helper;
@@ -12,14 +13,11 @@ use google_drive3::hyper;
 use human_bytes::human_bytes;
 use std::collections::HashSet;
 use std::error;
-use std::fmt::Display;
-use std::fmt::Formatter;
+use std::fmt::{Display,Formatter};
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::io::BufReader;
-use std::io::Read;
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -51,6 +49,59 @@ pub enum ExistingFileAction {
     Abort,
     Overwrite,
     SyncLocal,
+}
+
+pub async fn download(config: Config) -> Result<(), Error> {
+    let hub = Arc::new(hub_helper::get_hub().await.map_err(Error::Hub)?);
+
+    let file_id: String;
+    if let Some(ref id) = config.file_id {
+        if config.file_name.is_some() {
+            return Err(Error::Generic(
+                "Only one of file_id or file_name can be specified".to_string(),
+            ));
+        }
+        file_id = id.clone();
+    } else if let Some(ref name) = config.file_name {
+        file_id = drive_names::resolve(&hub, &name)
+            .await
+            .map_err(|err| Error::Generic(err.to_string()))?;
+    } else {
+        return Err(Error::Generic(
+            "Either file_id or file_name must be specified".to_string(),
+        ));
+    }
+
+    let file = files::info::get_file(&hub, &file_id)
+        .await
+        .map_err(Error::GetFile)?;
+    let item =
+        DriveItem::from_drive_file(&file).map_err(|err| Error::Generic(format!("{}", err)))?;
+
+    let dest: Option<PathBuf>;
+    match &config.destination {
+        Destination::Stdout => {
+            dest = None;
+        }
+        Destination::CurrentDir => {
+            dest = Some(PathBuf::from(""));
+        }
+
+        Destination::Path(path) => {
+            dest = Some(path.clone());
+        }
+    }
+
+    let tm = Arc::new(TaskManager::new(config.workers));
+    let context = DownloadContext {
+        hub: hub.clone(),
+        tm: tm.clone(),
+        options: (&config.options).clone(),
+    };
+
+    tm.add_task(Box::new(DownloadTask::new(context.clone(), item, dest)));
+    tm.wait().await;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -218,59 +269,6 @@ impl DriveTask for DownloadTask {
             }
         }
     }
-}
-
-pub async fn download(config: Config) -> Result<(), Error> {
-    let hub = Arc::new(hub_helper::get_hub().await.map_err(Error::Hub)?);
-
-    let file_id: String;
-    if let Some(ref id) = config.file_id {
-        if config.file_name.is_some() {
-            return Err(Error::Generic(
-                "Only one of file_id or file_name can be specified".to_string(),
-            ));
-        }
-        file_id = id.clone();
-    } else if let Some(ref name) = config.file_name {
-        file_id = drive_names::resolve(&hub, &name)
-            .await
-            .map_err(|err| Error::Generic(err.to_string()))?;
-    } else {
-        return Err(Error::Generic(
-            "Either file_id or file_name must be specified".to_string(),
-        ));
-    }
-
-    let file = files::info::get_file(&hub, &file_id)
-        .await
-        .map_err(Error::GetFile)?;
-    let item =
-        DriveItem::from_drive_file(&file).map_err(|err| Error::Generic(format!("{}", err)))?;
-
-    let dest: Option<PathBuf>;
-    match &config.destination {
-        Destination::Stdout => {
-            dest = None;
-        }
-        Destination::CurrentDir => {
-            dest = Some(PathBuf::from(""));
-        }
-
-        Destination::Path(path) => {
-            dest = Some(path.clone());
-        }
-    }
-
-    let tm = Arc::new(TaskManager::new(config.workers));
-    let context = DownloadContext {
-        hub: hub.clone(),
-        tm: tm.clone(),
-        options: (&config.options).clone(),
-    };
-
-    tm.add_task(Box::new(DownloadTask::new(context.clone(), item, dest)));
-    tm.wait().await;
-    Ok(())
 }
 
 fn create_dir_if_needed(path: &PathBuf) -> Result<usize, Error> {
