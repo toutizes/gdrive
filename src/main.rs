@@ -157,7 +157,12 @@ enum FileCommand {
     /// Download file
     Download {
         /// File id
-        file_id: String,
+        #[arg(long)]
+        file_id: Option<String>,
+
+        /// File name
+        #[arg(long)]
+        file_name: Option<String>,
 
         /// Overwrite existing files and folders
         #[arg(long)]
@@ -501,6 +506,7 @@ async fn main() {
 
                 FileCommand::Download {
                     file_id,
+                    file_name,
                     overwrite,
                     sync,
                     follow_shortcuts,
@@ -527,6 +533,7 @@ async fn main() {
 
                     files::download(files::download::Config {
                         file_id,
+                        file_name,
                         existing_file_action,
                         follow_shortcuts,
                         download_directories: recursive,

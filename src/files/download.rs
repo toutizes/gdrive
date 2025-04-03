@@ -1,4 +1,5 @@
 use crate::common::drive_file;
+use crate::common::drive_names;
 use crate::common::file_tree_drive;
 use crate::common::file_tree_drive::{FileTreeDrive, Folder};
 use crate::common::hub_helper;
@@ -25,7 +26,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub struct Config {
-    pub file_id: String,
+    pub file_id: Option<String>,
+    pub file_name: Option<String>,
     pub existing_file_action: ExistingFileAction,
     pub follow_shortcuts: bool,
     pub download_directories: bool,
@@ -142,7 +144,25 @@ impl DriveTask for DownloadTask {
 pub async fn download(config: Config) -> Result<(), Error> {
     let hub = Arc::new(hub_helper::get_hub().await.map_err(Error::Hub)?);
 
-    let file = files::info::get_file(&hub, &config.file_id)
+    let file_id: String;
+    if let Some(ref id) = config.file_id {
+        if config.file_name.is_some() {
+            return Err(Error::Generic(
+                "Only one of file_id or file_name can be specified".to_string(),
+            ));
+        }
+        file_id = id.clone();
+    } else if let Some(ref name) = config.file_name {
+        file_id = drive_names::resolve(&hub, &name)
+            .await
+            .map_err(|err| Error::Generic(err.to_string()))?;
+    } else {
+        return Err(Error::Generic(
+            "Either file_id or file_name must be specified".to_string(),
+        ));
+    }
+
+    let file = files::info::get_file(&hub, &file_id)
         .await
         .map_err(Error::GetFile)?;
 
@@ -156,14 +176,15 @@ pub async fn download(config: Config) -> Result<(), Error> {
         err_if_shortcut_target_is_missing(&target_file_id)?;
 
         download(Config {
-            file_id: target_file_id.unwrap_or_default(),
+            file_id: Some(target_file_id.unwrap_or_default()),
+            file_name: None,
             ..config
         })
         .await?;
     } else if drive_file::is_directory(&file) {
         download_directory(&hub, &file, &config).await?;
     } else {
-        download_regular(&hub, &file, &config).await?;
+        download_regular(&hub, &file, &file_id, &config).await?;
     }
 
     Ok(())
@@ -172,11 +193,12 @@ pub async fn download(config: Config) -> Result<(), Error> {
 pub async fn download_regular(
     hub: &Arc<Hub>,
     file: &google_drive3::api::File,
+    file_id: &String,
     config: &Config,
 ) -> Result<(), Error> {
     match &config.destination {
         Destination::Stdout => {
-            let task = DownloadTask::new(hub.clone(), config.file_id.clone(), None, None);
+            let task = DownloadTask::new(hub.clone(), file_id.clone(), None, None);
             task.process().await;
         }
 
@@ -187,7 +209,7 @@ pub async fn download_regular(
 
             let task = DownloadTask::new(
                 hub.clone(),
-                config.file_id.clone(),
+                file_id.clone(),
                 Some(abs_file_path.clone()),
                 file.md5_checksum.clone(),
             );
@@ -371,6 +393,7 @@ pub enum Error {
     MissingShortcutTarget,
     IsShortcut(String),
     StdoutNotValidDestination,
+    Generic(String),
 }
 
 impl error::Error for Error {}
@@ -446,6 +469,7 @@ impl Display for Error {
                 f,
                 "Stdout is not a valid destination for this combination of options"
             ),
+            Error::Generic(s) => write!(f, "{}", s),
         }
     }
 }

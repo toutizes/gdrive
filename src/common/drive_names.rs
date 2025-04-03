@@ -12,7 +12,7 @@ struct DriveIdAndIsDirectory {
 // Returns an error if the file is not found.
 //
 // TODO: Support <drive name>:path/path/file
-pub async fn resolve(hub: &Hub, filepath: &String) -> Result<Option<String>, CommonError> {
+pub async fn resolve(hub: &Hub, filepath: &String) -> Result<String, CommonError> {
     let mut last_found = DriveIdAndIsDirectory {
         id: None,
         is_dir: false,
@@ -35,7 +35,10 @@ pub async fn resolve(hub: &Hub, filepath: &String) -> Result<Option<String>, Com
         last_found = find_part(filepath, part, &files)?;
     }
 
-    Ok(last_found.id)
+    if let Some(id) = last_found.id {
+        return Ok(id.clone());
+    }
+    Err(CommonError::Generic(format!("{}: Empty path", filepath)))
 }
 
 fn make_query(
