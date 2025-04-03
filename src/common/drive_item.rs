@@ -50,24 +50,26 @@ impl DriveItem {
     }
 }
 
-fn get_file_id(file: &google_drive3::api::File) -> Result<String, CommonError> {
-    if let Some(ref id) = file.id {
-        return Ok(id.clone());
-    } else {
-        return Err(CommonError::Generic(format!("Missing file id: {:?}", file)));
-    }
+macro_rules! get_file_property {
+    ($func_name:ident, $property:ident, $return_type:ty, $error_message:literal) => {
+        fn $func_name(file: &google_drive3::api::File) -> Result<$return_type, CommonError> {
+            if let Some(ref value) = file.$property {
+                return Ok(value.clone());
+            } else {
+                return Err(CommonError::Generic(format!(
+                    $error_message, file
+                )));
+            }
+        }
+    };
 }
 
-fn get_file_name(file: &google_drive3::api::File) -> Result<String, CommonError> {
-    if let Some(ref name) = file.name {
-        return Ok(name.clone());
-    } else {
-        return Err(CommonError::Generic(format!(
-            "Missing file name: {:?}",
-            file
-        )));
-    }
-}
+get_file_property!(get_file_id, id, String, "Missing file id: {:?}");
+get_file_property!(get_file_name, name, String, "Missing file name: {:?}");
+get_file_property!(get_file_md5, md5_checksum, String, "Missing file md5: {:?}");
+get_file_property!(get_file_mime_type, mime_type, String, "Missing file mime_type: {:?}");
+get_file_property!(get_file_size, size, i64, "Missing file size: {:?}");
+
 
 fn get_file_parent(file: &google_drive3::api::File) -> Result<Option<String>, CommonError> {
     if let Some(ref parents) = file.parents {
@@ -83,39 +85,6 @@ fn get_file_parent(file: &google_drive3::api::File) -> Result<Option<String>, Co
         }
     } else {
         return Ok(None);
-    }
-}
-
-fn get_file_md5(file: &google_drive3::api::File) -> Result<String, CommonError> {
-    if let Some(ref md5) = file.md5_checksum {
-        return Ok(md5.clone());
-    } else {
-        return Err(CommonError::Generic(format!(
-            "Missing file md5: {:?}",
-            file
-        )));
-    }
-}
-
-fn get_file_mime_type(file: &google_drive3::api::File) -> Result<String, CommonError> {
-    if let Some(ref mime_type) = file.mime_type {
-        return Ok(mime_type.clone());
-    } else {
-        return Err(CommonError::Generic(format!(
-            "Missing file mime_type: {:?}",
-            file
-        )));
-    }
-}
-
-fn get_file_size(file: &google_drive3::api::File) -> Result<i64, CommonError> {
-    if let Some(size) = file.size {
-        return Ok(size);
-    } else {
-        return Err(CommonError::Generic(format!(
-            "Missing file size: {:?}",
-            file
-        )));
     }
 }
 
