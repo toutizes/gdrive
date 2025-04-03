@@ -1,4 +1,3 @@
-
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
 use crate::common::hub_helper;
@@ -13,7 +12,7 @@ use google_drive3::hyper;
 use human_bytes::human_bytes;
 use std::collections::HashSet;
 use std::error;
-use std::fmt::{Display,Formatter};
+use std::fmt::{Display, Formatter};
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -131,15 +130,16 @@ impl DownloadTask {
     pub async fn download(&self) -> Result<(), Error> {
         match &self.item.details {
             DriveItemDetails::Directory {} => {
-                return self.download_directory().await;
+                self.download_directory().await?;
             }
             DriveItemDetails::File { ref md5, .. } => {
-                return self.download_file(md5).await;
+                self.download_file(md5).await?;
             }
             DriveItemDetails::Shortcut { ref target_id, .. } => {
-                return self.download_shortcut(target_id).await;
+                self.download_shortcut(target_id).await?;
             }
         }
+        Ok(())
     }
 
     async fn download_directory(&self) -> Result<(), Error> {
@@ -177,19 +177,25 @@ impl DownloadTask {
         // the extra local files later.
         let mut keep_names: HashSet<String> = HashSet::new();
 
-        // Ge
         for file in &files {
-            let item = DriveItem::from_drive_file(&file)
-                .map_err(|err| Error::Generic(format!("{}", err)))?;
-            keep_names.insert(item.name.clone());
+            let item_result =
+                DriveItem::from_drive_file(&file).map_err(|err| Error::Generic(format!("{}", err)));
+            match item_result {
+                Ok(item) => {
+                    keep_names.insert(item.name.clone());
 
-            let itempath = Some(filepath.join(&item.name));
+                    let itempath = Some(filepath.join(&item.name));
 
-            self.context.tm.add_task(Box::new(DownloadTask::new(
-                self.context.clone(),
-                item,
-                itempath,
-            )));
+                    self.context.tm.add_task(Box::new(DownloadTask::new(
+                        self.context.clone(),
+                        item,
+                        itempath,
+                    )));
+                }
+                Err(err) => {
+                    println!("{:?}: {}", file.name, err.to_string());
+                }
+            }
         }
 
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
@@ -265,6 +271,7 @@ impl DriveTask for DownloadTask {
         match result {
             Ok(_) => {}
             Err(e) => {
+                println!("Err: {}", e.to_string());
                 *(self.status.lock().unwrap()) = DriveTaskStatus::Failed(e.to_string());
             }
         }
@@ -274,7 +281,7 @@ impl DriveTask for DownloadTask {
 fn create_dir_if_needed(path: &PathBuf) -> Result<usize, Error> {
     // Only create the directory if it doesn't exist
     if !path.exists() {
-        println!("Creating directory {}", path.display());
+        println!("{}: created directory", path.display());
         fs::create_dir_all(&path).map_err(|err| Error::CreateDirectory(path.clone(), err))?;
     } else {
         let file_type = fs::metadata(&path)
@@ -300,9 +307,9 @@ fn delete_extra_local_files(
         }
         let entry_type = valid_entry.file_type()?;
         if entry_type.is_file() || entry_type.is_symlink() {
-            let absolute_file_path = valid_entry.path();
-            println!("Deleting: {:?}", absolute_file_path);
-            fs::remove_file(absolute_file_path)?;
+            let delete_path = &valid_entry.path();
+            fs::remove_file(delete_path)?;
+            println!("{}: deleted", delete_path.display());
             n += 1;
         } else {
             println!(
