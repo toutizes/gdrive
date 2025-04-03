@@ -22,6 +22,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct DownloadOptions {
@@ -168,12 +169,14 @@ impl DownloadTask {
                         return Ok(());
                     }
                 }
-                println!("Download file : {}", filepath.display());
+                let start = Instant::now();
                 let body = download_file(&self.context.hub, &self.item.id)
                     .await
                     .map_err(Error::DownloadFile)?;
                 let file_bytes = save_body_to_file(body, &filepath, Some(md5.clone())).await?;
                 *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
+                let duration = start.elapsed();
+                println!("{}: {}s", filepath.display(), duration.as_secs());
             }
             None => {
                 let body = download_file(&self.context.hub, &self.item.id)
