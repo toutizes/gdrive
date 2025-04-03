@@ -1,13 +1,11 @@
-use crate::common::drive_file;
+use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
-use crate::common::file_tree_drive;
-use crate::common::file_tree_drive::{FileTreeDrive, Folder};
 use crate::common::hub_helper;
 use crate::common::md5_writer::Md5Writer;
 use crate::files;
+use crate::files::list;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use google_drive3::hyper;
@@ -25,44 +23,19 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-pub struct Config {
-    pub file_id: Option<String>,
-    pub file_name: Option<String>,
+#[derive(Clone, Debug)]
+pub struct DownloadOptions {
     pub existing_file_action: ExistingFileAction,
     pub follow_shortcuts: bool,
     pub download_directories: bool,
-    pub destination: Destination,
-    pub workers: usize,
 }
 
-impl Config {
-    fn canonical_destination_root(&self) -> Result<PathBuf, Error> {
-        match &self.destination {
-            Destination::CurrentDir => {
-                let current_path = PathBuf::from(".");
-                let canonical_current_path = current_path
-                    .canonicalize()
-                    .map_err(|err| Error::CanonicalizeDestinationPath(current_path.clone(), err))?;
-                Ok(canonical_current_path)
-            }
-
-            Destination::Path(path) => {
-                if !path.exists() {
-                    Err(Error::DestinationPathDoesNotExist(path.clone()))
-                } else if !path.is_dir() {
-                    Err(Error::DestinationPathNotADirectory(path.clone()))
-                } else {
-                    path.canonicalize()
-                        .map_err(|err| Error::CanonicalizeDestinationPath(path.clone(), err))
-                }
-            }
-
-            Destination::Stdout => {
-                // fmt
-                Err(Error::StdoutNotValidDestination)
-            }
-        }
-    }
+pub struct Config {
+    pub file_id: Option<String>,
+    pub file_name: Option<String>,
+    pub destination: Destination,
+    pub options: DownloadOptions,
+    pub workers: usize,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -79,46 +52,150 @@ pub enum ExistingFileAction {
     SyncLocal,
 }
 
-// Task for copying a file.
-pub struct DownloadTask {
+#[derive(Clone)]
+pub struct DownloadContext {
     hub: Arc<Hub>,
-    driveid: String,
-    // If not specified, download the file to stdout
-    filepath: Option<PathBuf>,
-    md5: Option<String>,
-    pub status: Mutex<DriveTaskStatus>,
+    tm: Arc<TaskManager>,
+    options: DownloadOptions,
+}
+
+pub struct DownloadTask {
+    context: DownloadContext,
+    item: DriveItem,
+    filepath: Option<PathBuf>, // If None, download the file to stdout
+    status: Mutex<DriveTaskStatus>,
 }
 
 impl DownloadTask {
-    pub fn new(
-        hub: Arc<Hub>,
-        driveid: String,
-        filepath: Option<PathBuf>,
-        md5: Option<String>,
-    ) -> Self {
+    pub fn new(context: DownloadContext, item: DriveItem, filepath: Option<PathBuf>) -> Self {
         Self {
-            hub,
-            driveid,
+            context,
+            item,
             filepath,
             status: Mutex::new(DriveTaskStatus::Pending),
-            md5,
         }
     }
 
     pub async fn download(&self) -> Result<(), Error> {
-        println!("Downloading {:?}", self.filepath);
-        let body = download_file(&self.hub, &self.driveid)
-            .await
-            .map_err(Error::DownloadFile)?;
+        match &self.item.details {
+            DriveItemDetails::Directory {} => {
+                return self.download_directory().await;
+            }
+            DriveItemDetails::File { ref md5, .. } => {
+                return self.download_file(md5).await;
+            }
+            DriveItemDetails::Shortcut { ref target_id, .. } => {
+                return self.download_shortcut(target_id).await;
+            }
+        }
+    }
+
+    async fn download_directory(&self) -> Result<(), Error> {
+        if !self.context.options.download_directories {
+            return Err(Error::Generic(format!(
+                "{}: drive file is a directory, use --recursive to download directories",
+                self.item.name,
+            )));
+        }
+
+        let filepath: &PathBuf = self
+            .filepath
+            .as_ref()
+            .ok_or(Error::Generic(
+                "Directories cannot be downloaded to stdout".to_string(),
+            ))
+            .unwrap();
+
+        create_dir_if_needed(filepath)?;
+
+        let files = list::list_files(
+            &self.context.hub,
+            &list::ListFilesConfig {
+                query: list::ListQuery::FilesInFolder {
+                    folder_id: self.item.id.clone(),
+                },
+                order_by: Default::default(),
+                max_files: usize::MAX,
+            },
+        )
+        .await
+        .map_err(|err| Error::Generic(format!("{}", err)))?;
+
+        // Use to collect the existing drive files if we want to delete
+        // the extra local files later.
+        let mut keep_names: HashSet<String> = HashSet::new();
+
+        // Ge
+        for file in &files {
+            let item = DriveItem::from_drive_file(&file)
+                .map_err(|err| Error::Generic(format!("{}", err)))?;
+            keep_names.insert(item.name.clone());
+
+            let itempath = Some(filepath.join(&item.name));
+
+            self.context.tm.add_task(Box::new(DownloadTask::new(
+                self.context.clone(),
+                item,
+                itempath,
+            )));
+        }
+
+        // NOTE: This runs after we launched the tasks to dowload the directory contents.
+        if self.context.options.existing_file_action == ExistingFileAction::SyncLocal {
+            delete_extra_local_files(filepath, &keep_names)
+                .map_err(|err| Error::Generic(format!("{}", err)))?;
+        }
+
+        *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(0);
+        Ok(())
+    }
+
+    async fn download_file(&self, md5: &String) -> Result<(), Error> {
         match &self.filepath {
-            Some(actual_path) => {
-                let file_bytes = save_body_to_file(body, &actual_path, self.md5.clone()).await?;
+            Some(filepath) => {
+                let options = &self.context.options;
+                if filepath.exists() {
+                    if filepath.is_dir() {
+                        return Err(Error::Generic(format!(
+                            "{}: this drive file exists as a local directory, not downloaded",
+                            filepath.display()
+                        )));
+                    }
+                    if options.existing_file_action == ExistingFileAction::Abort {
+                        return Err(Error::FileExists(filepath.clone()));
+                    }
+                    if local_file_is_identical(filepath, md5) {
+                        return Ok(());
+                    }
+                }
+                println!("Download file : {}", filepath.display());
+                let body = download_file(&self.context.hub, &self.item.id)
+                    .await
+                    .map_err(Error::DownloadFile)?;
+                let file_bytes = save_body_to_file(body, &filepath, Some(md5.clone())).await?;
                 *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
             }
             None => {
+                let body = download_file(&self.context.hub, &self.item.id)
+                    .await
+                    .map_err(Error::DownloadFile)?;
                 save_body_to_stdout(body).await?;
             }
         };
+        Ok(())
+    }
+
+    async fn download_shortcut(&self, target_id: &String) -> Result<(), Error> {
+        let target_file = files::info::get_file(&self.context.hub, target_id)
+            .await
+            .map_err(Error::GetFile)?;
+        let target_item = DriveItem::from_drive_file(&target_file)
+            .map_err(|err| Error::Generic(format!("{}", err)))?;
+        self.context.tm.add_task(Box::new(DownloadTask::new(
+            self.context.clone(),
+            target_item,
+            self.filepath.clone(),
+        )));
         Ok(())
     }
 }
@@ -140,7 +217,6 @@ impl DriveTask for DownloadTask {
     }
 }
 
-#[async_recursion]
 pub async fn download(config: Config) -> Result<(), Error> {
     let hub = Arc::new(hub_helper::get_hub().await.map_err(Error::Hub)?);
 
@@ -165,58 +241,32 @@ pub async fn download(config: Config) -> Result<(), Error> {
     let file = files::info::get_file(&hub, &file_id)
         .await
         .map_err(Error::GetFile)?;
+    let item =
+        DriveItem::from_drive_file(&file).map_err(|err| Error::Generic(format!("{}", err)))?;
 
-    err_if_file_exists(&file, &config)?;
-    err_if_directory(&file, &config)?;
-    err_if_shortcut(&file, &config)?;
-
-    if drive_file::is_shortcut(&file) {
-        let target_file_id = file.shortcut_details.and_then(|details| details.target_id);
-
-        err_if_shortcut_target_is_missing(&target_file_id)?;
-
-        download(Config {
-            file_id: Some(target_file_id.unwrap_or_default()),
-            file_name: None,
-            ..config
-        })
-        .await?;
-    } else if drive_file::is_directory(&file) {
-        download_directory(&hub, &file, &config).await?;
-    } else {
-        download_regular(&hub, &file, &file_id, &config).await?;
-    }
-
-    Ok(())
-}
-
-pub async fn download_regular(
-    hub: &Arc<Hub>,
-    file: &google_drive3::api::File,
-    file_id: &String,
-    config: &Config,
-) -> Result<(), Error> {
+    let dest: Option<PathBuf>;
     match &config.destination {
         Destination::Stdout => {
-            let task = DownloadTask::new(hub.clone(), file_id.clone(), None, None);
-            task.process().await;
+            dest = None;
+        }
+        Destination::CurrentDir => {
+            dest = Some(PathBuf::from(""));
         }
 
-        _ => {
-            let file_name = file.name.clone().ok_or(Error::MissingFileName)?;
-            let root_path = config.canonical_destination_root()?;
-            let abs_file_path = root_path.join(&file_name);
-
-            let task = DownloadTask::new(
-                hub.clone(),
-                file_id.clone(),
-                Some(abs_file_path.clone()),
-                file.md5_checksum.clone(),
-            );
-            task.process().await;
+        Destination::Path(path) => {
+            dest = Some(path.clone());
         }
     }
 
+    let tm = Arc::new(TaskManager::new(config.workers));
+    let context = DownloadContext {
+        hub: hub.clone(),
+        tm: tm.clone(),
+        options: (&config.options).clone(),
+    };
+
+    tm.add_task(Box::new(DownloadTask::new(context.clone(), item, dest)));
+    tm.wait().await;
     Ok(())
 }
 
@@ -236,61 +286,31 @@ fn create_dir_if_needed(path: &PathBuf) -> Result<usize, Error> {
     Ok(1)
 }
 
-pub async fn download_directory(
-    hub: &Arc<Hub>,
-    file: &google_drive3::api::File,
-    config: &Config,
-) -> Result<(), Error> {
-    let tree = FileTreeDrive::from_file(&hub, &file)
-        .await
-        .map_err(Error::CreateFileTree)?;
-
-    let tree_info = tree.info();
-    let mut num_created_directories: usize = 0;
-    let mut num_deleted_files: usize = 0;
-    let tm = TaskManager::new(config.workers);
-
-    println!(
-        "Found {} files in {} directories with a total size of {}",
-        tree_info.file_count,
-        tree_info.folder_count,
-        human_bytes(tree_info.total_file_size as f64)
-    );
-
-    let root_path = config.canonical_destination_root()?;
-
-    for folder in &tree.folders() {
-        let folder_path = folder.relative_path();
-        let abs_folder_path = root_path.join(&folder_path);
-
-        num_created_directories += create_dir_if_needed(&abs_folder_path)?;
-
-        for file in folder.files() {
-            let file_path = file.relative_path();
-            let abs_file_path = root_path.join(&file_path);
-
-            if local_file_is_identical(&abs_file_path, &file) {
-                continue;
-            }
-
-            let t: DownloadTask = DownloadTask::new(
-                hub.clone(),
-                file.drive_id.clone(),
-                Some(abs_file_path.clone()),
-                file.md5.clone(),
-            );
-            tm.add_task(Box::new(t));
+fn delete_extra_local_files(
+    path: &PathBuf,
+    names_to_keep: &HashSet<String>,
+) -> Result<usize, std::io::Error> {
+    let mut n: usize = 0;
+    for entry in fs::read_dir(path)? {
+        let valid_entry = entry?;
+        let entry_name = valid_entry.file_name().to_string_lossy().to_string();
+        if names_to_keep.contains(&entry_name) {
+            continue;
         }
-        // NOTE: this runs synchronously, not like the copies.
-        if config.existing_file_action == ExistingFileAction::SyncLocal {
-            num_deleted_files += delete_extra_local_files(&folder, abs_folder_path.clone())
-                .await
-                .map_err(|err| Error::ReadDirectory(abs_folder_path.clone(), err))?;
+        let entry_type = valid_entry.file_type()?;
+        if entry_type.is_file() || entry_type.is_symlink() {
+            let absolute_file_path = valid_entry.path();
+            println!("Deleting: {:?}", absolute_file_path);
+            fs::remove_file(absolute_file_path)?;
+            n += 1;
+        } else {
+            println!(
+                "{}: not deleting (not a file or symlink)",
+                path.join(entry_name).display(),
+            );
         }
     }
-    report_stats(tm.wait().await, num_deleted_files, num_created_directories);
-
-    Ok(())
+    Ok(n)
 }
 
 pub fn report_stats(
@@ -325,37 +345,6 @@ pub fn report_stats(
     );
 }
 
-pub async fn delete_extra_local_files(
-    folder: &Folder,
-    abs_folder_path: PathBuf,
-) -> Result<usize, io::Error> {
-    let mut drive_files: HashSet<String> = HashSet::new();
-    for file in folder.files() {
-        drive_files.insert(file.name);
-    }
-
-    let mut num_deleted_files: usize = 0;
-
-    for entry in fs::read_dir(&abs_folder_path)? {
-        let valid_entry = entry?;
-        let file_type = valid_entry.file_type()?;
-        if file_type.is_file() || file_type.is_symlink() {
-            let relative_file_name = valid_entry.file_name().to_string_lossy().to_string();
-            if !drive_files.contains(&relative_file_name) {
-                let absolute_file_path = valid_entry.path();
-                println!("Deleting: {:?}", absolute_file_path);
-                fs::remove_file(absolute_file_path)?;
-                num_deleted_files += 1;
-            }
-            // We should also delete directories recursively
-            // Maybe a stronger prompt for allowing deletion of directories?
-            // like --full-sync ?
-        }
-    }
-
-    Ok(num_deleted_files)
-}
-
 pub async fn download_file(hub: &Hub, file_id: &str) -> Result<hyper::Body, google_drive3::Error> {
     let (response, _) = hub
         .files()
@@ -386,7 +375,7 @@ pub enum Error {
     ReadChunk(hyper::Error),
     ReadDirectory(PathBuf, io::Error),
     WriteChunk(io::Error),
-    CreateFileTree(file_tree_drive::Error),
+    // CreateFileTree(file_tree_drive::Error),
     DestinationPathDoesNotExist(PathBuf),
     DestinationPathNotADirectory(PathBuf),
     CanonicalizeDestinationPath(PathBuf, io::Error),
@@ -442,7 +431,7 @@ impl Display for Error {
             Error::RenameFile(err) => write!(f, "Failed to rename file: {}", err),
             Error::ReadChunk(err) => write!(f, "Failed read from stream: {}", err),
             Error::WriteChunk(err) => write!(f, "Failed write to file: {}", err),
-            Error::CreateFileTree(err) => write!(f, "Failed to create file tree: {}", err),
+            // Error::CreateFileTree(err) => write!(f, "Failed to create file tree: {}", err),
             Error::DestinationPathDoesNotExist(path) => {
                 write!(f, "Destination path '{}' does not exist", path.display())
             }
@@ -517,65 +506,6 @@ pub async fn save_body_to_stdout(mut body: hyper::Body) -> Result<(), Error> {
     Ok(())
 }
 
-fn err_if_file_exists(file: &google_drive3::api::File, config: &Config) -> Result<(), Error> {
-    let file_name = file.name.clone().ok_or(Error::MissingFileName)?;
-
-    let file_path = match &config.destination {
-        Destination::CurrentDir => Some(PathBuf::from(".").join(file_name)),
-        Destination::Path(path) => Some(path.join(file_name)),
-        Destination::Stdout => None,
-    };
-
-    match file_path {
-        Some(path) => {
-            if path.exists() && config.existing_file_action == ExistingFileAction::Abort {
-                Err(Error::FileExists(path.clone()))
-            } else {
-                Ok(())
-            }
-        }
-
-        None => {
-            // fmt
-            Ok(())
-        }
-    }
-}
-
-fn err_if_directory(file: &google_drive3::api::File, config: &Config) -> Result<(), Error> {
-    if drive_file::is_directory(file) && !config.download_directories {
-        let name = file
-            .name
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        Err(Error::IsDirectory(name))
-    } else {
-        Ok(())
-    }
-}
-
-fn err_if_shortcut(file: &google_drive3::api::File, config: &Config) -> Result<(), Error> {
-    if drive_file::is_shortcut(file) && !config.follow_shortcuts {
-        let name = file
-            .name
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        Err(Error::IsShortcut(name))
-    } else {
-        Ok(())
-    }
-}
-
-fn err_if_shortcut_target_is_missing(target_id: &Option<String>) -> Result<(), Error> {
-    if target_id.is_none() {
-        Err(Error::MissingShortcutTarget)
-    } else {
-        Ok(())
-    }
-}
-
 fn err_if_md5_mismatch(expected: Option<String>, actual: String) -> Result<(), Error> {
     let is_matching = expected.clone().map(|md5| md5 == actual).unwrap_or(true);
 
@@ -589,7 +519,7 @@ fn err_if_md5_mismatch(expected: Option<String>, actual: String) -> Result<(), E
     }
 }
 
-fn local_file_is_identical(path: &PathBuf, file: &file_tree_drive::File) -> bool {
+fn local_file_is_identical(path: &PathBuf, drive_md5: &String) -> bool {
     if path.exists() {
         let file_md5 = compute_md5_from_path(path).unwrap_or_else(|err| {
             eprintln!(
@@ -601,7 +531,7 @@ fn local_file_is_identical(path: &PathBuf, file: &file_tree_drive::File) -> bool
             String::new()
         });
 
-        file.md5.clone().map(|md5| md5 == file_md5).unwrap_or(false)
+        file_md5 == *drive_md5
     } else {
         false
     }

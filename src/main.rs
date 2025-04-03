@@ -534,9 +534,11 @@ async fn main() {
                     files::download(files::download::Config {
                         file_id,
                         file_name,
-                        existing_file_action,
-                        follow_shortcuts,
-                        download_directories: recursive,
+                        options: files::download::DownloadOptions {
+                            existing_file_action,
+                            follow_shortcuts,
+                            download_directories: recursive,
+                        },
                         destination: dst,
                         workers: workers.unwrap_or(1),
                     })
