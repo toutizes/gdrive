@@ -1,21 +1,19 @@
+use crate::common::drive_file_helper;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
 use crate::common::error::CommonError;
 use crate::common::hub_helper;
-use crate::common::md5_writer::Md5Writer;
 use crate::files;
 use crate::files::list;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
 use async_trait::async_trait;
-use futures::stream::StreamExt;
-use google_drive3::hyper;
 use human_bytes::human_bytes;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -287,10 +285,13 @@ impl DownloadTask {
                     }
                 }
                 let start = Instant::now();
-                let body = download_file(&self.context.hub, &self.item.id)
-                    .await
-                    .map_err(CommonError::DownloadFile)?;
-                let file_bytes = save_body_to_file(body, &filepath, Some(md5.clone())).await?;
+                let file_bytes = drive_file_helper::download_file(
+                    &self.context.hub,
+                    &self.item.id,
+                    Some(md5.clone()),
+                    Some(&filepath),
+                )
+                .await?;
                 *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
                 let duration = start.elapsed();
                 println!("{}: {:.2}s", filepath.display(), duration.as_secs_f64());
@@ -303,10 +304,16 @@ impl DownloadTask {
                 };
             }
             None => {
-                let body = download_file(&self.context.hub, &self.item.id)
-                    .await
-                    .map_err(CommonError::DownloadFile)?;
-                save_body_to_stdout(body).await?;
+                let file_bytes =
+                    drive_file_helper::download_file(&self.context.hub, &self.item.id, None, None)
+                        .await?;
+                *(self.stats.lock().unwrap()) = DownloadStats {
+                    num_files: 1,
+                    num_directories: 0,
+                    num_bytes: file_bytes,
+                    num_deleted_files: 0,
+                    num_errors: 0,
+                };
             }
         };
         Ok(())
@@ -387,75 +394,6 @@ fn delete_extra_local_files(
         }
     }
     Ok(n)
-}
-
-pub async fn download_file(hub: &Hub, file_id: &str) -> Result<hyper::Body, google_drive3::Error> {
-    let (response, _) = hub
-        .files()
-        .get(file_id)
-        .supports_all_drives(true)
-        .param("alt", "media")
-        .add_scope(google_drive3::api::Scope::Full)
-        .doit()
-        .await?;
-
-    Ok(response.into_body())
-}
-
-// TODO: move to common
-pub async fn save_body_to_file(
-    mut body: hyper::Body,
-    file_path: &PathBuf,
-    expected_md5: Option<String>,
-) -> Result<usize, CommonError> {
-    // Create temporary file
-    let tmp_file_path = file_path.with_extension("incomplete");
-    let file = File::create(&tmp_file_path).map_err(CommonError::CreateFile)?;
-
-    // Wrap file in writer that calculates md5
-    let mut writer = Md5Writer::new(file);
-    let mut written_bytes: usize = 0;
-
-    // Read chunks from stream and write to file
-    while let Some(chunk_result) = body.next().await {
-        let chunk = chunk_result.map_err(CommonError::ReadChunk)?;
-        writer.write_all(&chunk).map_err(CommonError::WriteChunk)?;
-        written_bytes += chunk.len();
-    }
-
-    // Check md5
-    err_if_md5_mismatch(expected_md5, writer.md5())?;
-
-    // Rename temporary file to final file
-    fs::rename(&tmp_file_path, &file_path).map_err(CommonError::RenameFile)?;
-
-    Ok(written_bytes)
-}
-
-// TODO: move to common
-pub async fn save_body_to_stdout(mut body: hyper::Body) -> Result<(), CommonError> {
-    let mut stdout = io::stdout();
-
-    // Read chunks from stream and write to stdout
-    while let Some(chunk_result) = body.next().await {
-        let chunk = chunk_result.map_err(CommonError::ReadChunk)?;
-        stdout.write_all(&chunk).map_err(CommonError::WriteChunk)?;
-    }
-
-    Ok(())
-}
-
-fn err_if_md5_mismatch(expected: Option<String>, actual: String) -> Result<(), CommonError> {
-    let is_matching = expected.clone().map(|md5| md5 == actual).unwrap_or(true);
-
-    if is_matching {
-        Ok(())
-    } else {
-        Err(CommonError::Md5Mismatch {
-            expected: expected.unwrap_or_default(),
-            actual,
-        })
-    }
 }
 
 fn local_file_is_identical(path: &PathBuf, drive_md5: &String) -> bool {

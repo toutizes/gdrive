@@ -1,12 +1,10 @@
-use mime::Mime;
-
 use crate::common::drive_file;
+use crate::common::drive_file_helper;
 use crate::common::drive_file::DocType;
 use crate::common::drive_file::FileExtension;
 use crate::common::error::CommonError;
 use crate::common::hub_helper;
 use crate::files;
-use crate::hub::Hub;
 use std::error;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -47,39 +45,14 @@ pub async fn export(config: Config) -> Result<(), Error> {
         .get_export_mime()
         .ok_or(Error::GetFileExtensionMime(extension.clone()))?;
 
-    let body = export_file(&hub, &config.file_id, &mime_type)
+    let _file_bytes = drive_file_helper::export_file(
+        &hub, &config.file_id, &mime_type, file.md5_checksum, &config.file_path)
         .await
         .map_err(Error::ExportFile)?;
-
-    println!(
-        "Exporting {} '{}' to {}",
-        doc_type,
-        file.name.unwrap_or_default(),
-        config.file_path.display()
-    );
-
-    files::download::save_body_to_file(body, &config.file_path, file.md5_checksum)
-        .await
-        .map_err(Error::SaveFile)?;
 
     println!("Successfully exported {}", config.file_path.display());
 
     Ok(())
-}
-
-pub async fn export_file(
-    hub: &Hub,
-    file_id: &str,
-    mime_type: &Mime,
-) -> Result<hyper::Body, google_drive3::Error> {
-    let response = hub
-        .files()
-        .export(file_id, &mime_type.to_string())
-        .add_scope(google_drive3::api::Scope::Full)
-        .doit()
-        .await?;
-
-    Ok(response.into_body())
 }
 
 #[derive(Debug)]
@@ -87,7 +60,7 @@ pub enum Error {
     Hub(hub_helper::Error),
     FileExists(PathBuf),
     GetFile(google_drive3::Error),
-    ExportFile(google_drive3::Error),
+    ExportFile(CommonError),
     MissingDriveMime,
     UnsupportedDriveMime(String),
     GetFileExtensionMime(drive_file::FileExtension),
