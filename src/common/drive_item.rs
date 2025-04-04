@@ -56,9 +56,7 @@ macro_rules! get_file_property {
             if let Some(ref value) = file.$property {
                 return Ok(value.clone());
             } else {
-                return Err(CommonError::Generic(format!(
-                    $error_message, file
-                )));
+                return Err(CommonError::Generic(format!($error_message, file)));
             }
         }
     };
@@ -67,9 +65,13 @@ macro_rules! get_file_property {
 get_file_property!(get_file_id, id, String, "Missing file id: {:?}");
 get_file_property!(get_file_name, name, String, "Missing file name: {:?}");
 get_file_property!(get_file_md5, md5_checksum, String, "Missing file md5: {:?}");
-get_file_property!(get_file_mime_type, mime_type, String, "Missing file mime_type: {:?}");
+get_file_property!(
+    get_file_mime_type,
+    mime_type,
+    String,
+    "Missing file mime_type: {:?}"
+);
 get_file_property!(get_file_size, size, i64, "Missing file size: {:?}");
-
 
 fn get_file_parent(file: &google_drive3::api::File) -> Result<Option<String>, CommonError> {
     if let Some(ref parents) = file.parents {
@@ -88,31 +90,22 @@ fn get_file_parent(file: &google_drive3::api::File) -> Result<Option<String>, Co
     }
 }
 
-fn get_shortcut_target_id(
-    details: &google_drive3::api::FileShortcutDetails,
-) -> Result<String, CommonError> {
-    if let Some(ref target_id) = details.target_id {
-        return Ok(target_id.clone());
-    } else {
-        return Err(CommonError::Generic(format!(
-            "Shortcut details missing target_id: {:?}",
-            details,
-        )));
-    }
+macro_rules! get_shortcut_property {
+    ($func_name:ident, $property:ident, $return_type:ty, $error_message:literal) => {
+        fn $func_name(
+            shortcut: &google_drive3::api::FileShortcutDetails,
+        ) -> Result<$return_type, CommonError> {
+            if let Some(ref value) = shortcut.$property {
+                return Ok(value.clone());
+            } else {
+                return Err(CommonError::Generic(format!($error_message, shortcut)));
+            }
+        }
+    };
 }
 
-fn get_shortcut_target_mime_type(
-    details: &google_drive3::api::FileShortcutDetails,
-) -> Result<String, CommonError> {
-    if let Some(ref target_mime_type) = details.target_mime_type {
-        return Ok(target_mime_type.clone());
-    } else {
-        return Err(CommonError::Generic(format!(
-            "Shortcut details missing target_mime_type: {:?}",
-            details,
-        )));
-    }
-}
+get_shortcut_property!(get_shortcut_target_id, target_id, String, "Missing target id: {:?}");
+get_shortcut_property!(get_shortcut_target_mime_type, target_mime_type, String, "Missing target id: {:?}");
 
 fn get_file_shortcut_details(
     file: &google_drive3::api::File,
