@@ -14,13 +14,13 @@ pub trait DriveTask {
     fn get_status(&self) -> DriveTaskStatus;
 }
 
-pub struct TaskManager {
-    tasks: Mutex<Vec<Arc<Box<dyn DriveTask + Send + Sync>>>>,
+pub struct TaskManager<T: DriveTask + Send + Sync + 'static> {
+    tasks: Mutex<Vec<Arc<Box<T>>>>,
     task_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
 }
 
-impl TaskManager {
+impl<T: DriveTask + Send + Sync + 'static> TaskManager<T> {
     pub fn new(num_workers: usize) -> Self {
         Self {
             tasks: Mutex::new(Vec::new()),
@@ -29,8 +29,8 @@ impl TaskManager {
         }
     }
 
-    pub fn add_task(&self, task: Box<dyn DriveTask + Sync + Send>) {
-        let task_arc = Arc::new(task);
+    pub fn add_task(&self, task: T) {
+        let task_arc = Arc::new(Box::new(task));
         self.tasks.lock().unwrap().push(Arc::clone(&task_arc));
 
         let task_clone = Arc::clone(&task_arc);
@@ -50,7 +50,7 @@ impl TaskManager {
         self.task_handles.lock().unwrap().push(handle);
     }
 
-    pub async fn wait(&self) -> Vec<Arc<Box<dyn DriveTask + Sync + Send>>> {
+    pub async fn wait(&self) -> Vec<Arc<Box<T>>> {
         loop {
             let mut remaining_handles = Vec::new();
             {

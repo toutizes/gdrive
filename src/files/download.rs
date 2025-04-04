@@ -18,7 +18,7 @@ use std::io;
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct DownloadOptions {
@@ -50,6 +50,7 @@ pub enum ExistingFileAction {
 }
 
 pub async fn download(config: Config) -> Result<(), CommonError> {
+    let start = Instant::now();
     let hub = Arc::new(hub_helper::get_hub().await.map_err(CommonError::Hub)?);
 
     let file_id: String;
@@ -97,16 +98,34 @@ pub async fn download(config: Config) -> Result<(), CommonError> {
         options: (&config.options).clone(),
     };
 
-    tm.add_task(Box::new(DownloadTask::new(context.clone(), item, dest)));
-    tm.wait().await;
+    tm.add_task(DownloadTask::new(context.clone(), item, dest));
+    let tasks = tm.wait().await;
+    report_stats(tasks, start.elapsed());
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct DownloadContext {
-    hub: Arc<Hub>,
-    tm: Arc<TaskManager>,
-    options: DownloadOptions,
+fn report_stats(tasks: Vec<Arc<Box<DownloadTask>>>, duration: Duration) {
+    let mut acc = DownloadStats {
+        num_files: 0,
+        num_directories: 0,
+        num_bytes: 0,
+        num_deleted_files: 0,
+        num_errors: 0,
+    };
+    for task in &tasks {
+        let stats = task.stats.lock().unwrap();
+        acc.accumulate(&stats);
+    }
+    println!(
+        "Download finished.\n directories: {}\n files: {}\n bytes: {}\n duratin: {:.2}s\n bandwidth: {:.2} Mb/s\n deletions: {}\n errors: {}",
+        acc.num_directories,
+        acc.num_files,
+        human_bytes(acc.num_bytes as f64),
+        duration.as_secs_f64(),
+        acc.num_bytes as f64/ (1024.0 * 128.0 * duration.as_secs_f64()),
+        acc.num_deleted_files,
+        acc.num_errors,
+    );
 }
 
 pub struct DownloadTask {
@@ -114,6 +133,33 @@ pub struct DownloadTask {
     item: DriveItem,
     filepath: Option<PathBuf>, // If None, download the file to stdout
     status: Mutex<DriveTaskStatus>,
+    stats: Mutex<DownloadStats>,
+}
+
+#[derive(Clone)]
+pub struct DownloadContext {
+    hub: Arc<Hub>,
+    tm: Arc<TaskManager<DownloadTask>>,
+    options: DownloadOptions,
+}
+
+#[derive(Debug)]
+pub struct DownloadStats {
+    pub num_files: usize,
+    pub num_directories: usize,
+    pub num_bytes: usize,
+    pub num_deleted_files: usize,
+    pub num_errors: usize,
+}
+
+impl DownloadStats {
+    pub fn accumulate(&mut self, stat: &DownloadStats) {
+        self.num_files += stat.num_files;
+        self.num_directories += stat.num_directories;
+        self.num_bytes += stat.num_bytes;
+        self.num_deleted_files += stat.num_deleted_files;
+        self.num_errors += stat.num_errors;
+    }
 }
 
 impl DownloadTask {
@@ -123,6 +169,13 @@ impl DownloadTask {
             item,
             filepath,
             status: Mutex::new(DriveTaskStatus::Pending),
+            stats: Mutex::new(DownloadStats {
+                num_files: 0,
+                num_directories: 0,
+                num_bytes: 0,
+                num_deleted_files: 0,
+                num_errors: 0,
+            }),
         }
     }
 
@@ -157,7 +210,7 @@ impl DownloadTask {
             ))
             .unwrap();
 
-        create_dir_if_needed(filepath)?;
+        let num_dirs_created = create_dir_if_needed(filepath)?;
 
         let files = list::list_files(
             &self.context.hub,
@@ -185,11 +238,11 @@ impl DownloadTask {
 
                     let itempath = Some(filepath.join(&item.name));
 
-                    self.context.tm.add_task(Box::new(DownloadTask::new(
+                    self.context.tm.add_task(DownloadTask::new(
                         self.context.clone(),
                         item,
                         itempath,
-                    )));
+                    ));
                 }
                 Err(err) => {
                     println!("{:?}: {}", file.name, err.to_string());
@@ -198,11 +251,19 @@ impl DownloadTask {
         }
 
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
+        let mut num_files_deleted: usize = 0;
         if self.context.options.existing_file_action == ExistingFileAction::SyncLocal {
-            delete_extra_local_files(filepath, &keep_names)
+            num_files_deleted = delete_extra_local_files(filepath, &keep_names)
                 .map_err(|err| CommonError::Generic(format!("{}", err)))?;
         }
 
+        *(self.stats.lock().unwrap()) = DownloadStats {
+            num_files: 0,
+            num_directories: num_dirs_created,
+            num_bytes: 0,
+            num_deleted_files: num_files_deleted,
+            num_errors: 0,
+        };
         *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(0);
         Ok(())
     }
@@ -232,7 +293,14 @@ impl DownloadTask {
                 let file_bytes = save_body_to_file(body, &filepath, Some(md5.clone())).await?;
                 *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
                 let duration = start.elapsed();
-                println!("{}: {}s", filepath.display(), duration.as_secs());
+                println!("{}: {:.2}s", filepath.display(), duration.as_secs_f64());
+                *(self.stats.lock().unwrap()) = DownloadStats {
+                    num_files: 1,
+                    num_directories: 0,
+                    num_bytes: file_bytes,
+                    num_deleted_files: 0,
+                    num_errors: 0,
+                };
             }
             None => {
                 let body = download_file(&self.context.hub, &self.item.id)
@@ -250,11 +318,11 @@ impl DownloadTask {
             .map_err(CommonError::GetFile)?;
         let target_item = DriveItem::from_drive_file(&target_file)
             .map_err(|err| CommonError::Generic(format!("{}", err)))?;
-        self.context.tm.add_task(Box::new(DownloadTask::new(
+        self.context.tm.add_task(DownloadTask::new(
             self.context.clone(),
             target_item,
             self.filepath.clone(),
-        )));
+        ));
         Ok(())
     }
 }
@@ -282,6 +350,7 @@ fn create_dir_if_needed(path: &PathBuf) -> Result<usize, CommonError> {
     if !path.exists() {
         println!("{}: created directory", path.display());
         fs::create_dir_all(&path).map_err(|err| CommonError::CreateDirectory(path.clone(), err))?;
+        return Ok(1);
     } else {
         let file_type = fs::metadata(&path)
             .map_err(|err| CommonError::CreateDirectory(path.clone(), err))?
@@ -290,7 +359,7 @@ fn create_dir_if_needed(path: &PathBuf) -> Result<usize, CommonError> {
             return Err(CommonError::IsNotDirectory(path.display().to_string()));
         }
     }
-    Ok(1)
+    Ok(0)
 }
 
 fn delete_extra_local_files(
@@ -320,42 +389,7 @@ fn delete_extra_local_files(
     Ok(n)
 }
 
-pub fn report_stats(
-    tasks: Vec<Arc<Box<dyn DriveTask + Sync + Send>>>,
-    num_deleted_files: usize,
-    num_created_directories: usize,
-) {
-    let mut num_success = 0;
-    let mut num_failures = 0;
-    let mut total_bytes = 0;
-
-    for task in tasks {
-        let status = task.get_status();
-        match status {
-            DriveTaskStatus::Pending => {}
-            DriveTaskStatus::Completed(file_bytes) => {
-                num_success += 1;
-                total_bytes += file_bytes;
-            }
-            DriveTaskStatus::Failed(_) => {
-                num_failures += 1;
-            }
-        };
-    }
-    println!(
-        "Download finished.\n files: {}\n directories: {}\n bytes: {}\n deletions: {}\n errors: {}",
-        num_success,
-        num_created_directories,
-        human_bytes(total_bytes as f64),
-        num_deleted_files,
-        num_failures
-    );
-}
-
-pub async fn download_file(
-    hub: &Hub,
-    file_id: &str,
-) -> Result<hyper::Body, google_drive3::Error> {
+pub async fn download_file(hub: &Hub, file_id: &str) -> Result<hyper::Body, google_drive3::Error> {
     let (response, _) = hub
         .files()
         .get(file_id)

@@ -117,7 +117,7 @@ pub async fn load_drive_tree(
     let tree = Arc::new(Mutex::new(DriveTree::new()));
     let tm = Arc::new(TaskManager::new(10));
     let task = LoadTask::new(hub.clone(), tm.clone(), tree.clone(), None, options.clone());
-    tm.add_task(Box::new(task));
+    tm.add_task(task);
     tm.wait().await;
     Ok(tree)
 }
@@ -130,7 +130,7 @@ pub enum DriveTreeLoadOptions {
 
 pub struct LoadTask {
     hub: Arc<Hub>,
-    tm: Arc<TaskManager>,
+    tm: Arc<TaskManager<LoadTask>>,
     tree: Arc<Mutex<DriveTree>>,
     parent_id: Option<String>,
     options: DriveTreeLoadOptions,
@@ -140,7 +140,7 @@ pub struct LoadTask {
 impl LoadTask {
     pub fn new(
         hub: Arc<Hub>,
-        tm: Arc<TaskManager>,
+        tm: Arc<TaskManager<LoadTask>>,
         tree: Arc<Mutex<DriveTree>>,
         parent_id: Option<String>,
         options: DriveTreeLoadOptions,
@@ -233,7 +233,7 @@ impl LoadTask {
                     Some(this_id.clone()),
                     DriveTreeLoadOptions::RecursiveFolder(sub_folder_id.clone()),
                 );
-                self.tm.add_task(Box::new(task));
+                self.tm.add_task(task);
             }
         }
 
