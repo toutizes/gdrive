@@ -202,9 +202,13 @@ enum FileCommand {
         #[arg(long, value_name = "MIME_TYPE")]
         mime: Option<Mime>,
 
-        /// Upload to an existing directory
+        /// Upload to an existing directory by drive id
         #[arg(long, value_name = "DIRECTORY_ID")]
         parent: Option<Vec<String>>,
+
+        /// Upload to an existing directory by drive path
+        #[arg(long, value_name = "DIRECTORY_ID")]
+        parent_path: Option<Vec<String>>,
 
         /// Upload directories. Note that this will always create a new directory on drive and will not update existing directories with the same name
         #[arg(long)]
@@ -550,6 +554,7 @@ async fn main() {
                     file_path,
                     mime,
                     parent,
+                    parent_path,
                     recursive,
                     chunk_size,
                     print_chunk_errors,
@@ -561,6 +566,7 @@ async fn main() {
                         file_path,
                         mime_type: mime,
                         parents: parent,
+                        parent_paths: parent_path,
                         chunk_size,
                         print_chunk_errors,
                         print_chunk_info,

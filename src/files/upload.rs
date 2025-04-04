@@ -2,11 +2,13 @@ use crate::common::delegate::BackoffConfig;
 use crate::common::delegate::ChunkSize;
 use crate::common::delegate::UploadDelegate;
 use crate::common::delegate::UploadDelegateConfig;
+use crate::common::drive_names;
+use crate::common::error::CommonError;
+use crate::common::file_helper;
 use crate::common::file_info;
 use crate::common::file_info::FileInfo;
 use crate::common::file_tree;
 use crate::common::file_tree::FileTree;
-use crate::common::file_helper;
 use crate::common::hub_helper;
 use crate::common::id_gen::IdGen;
 use crate::files;
@@ -27,6 +29,7 @@ pub struct Config {
     pub file_path: Option<PathBuf>,
     pub mime_type: Option<Mime>,
     pub parents: Option<Vec<String>>,
+    pub parent_paths: Option<Vec<String>>,
     pub chunk_size: ChunkSize,
     pub print_chunk_errors: bool,
     pub print_chunk_info: bool,
@@ -34,8 +37,12 @@ pub struct Config {
     pub print_only_id: bool,
 }
 
-pub async fn upload(config: Config) -> Result<(), Error> {
-    let hub = hub_helper::get_hub().await.map_err(Error::Hub)?;
+pub async fn upload(cl_config: Config) -> Result<(), CommonError> {
+    let hub = hub_helper::get_hub()
+        .await
+        .map_err(|err| CommonError::Hub(err))?;
+
+    let config = config_to_use(&hub, cl_config).await?;
 
     let delegate_config = UploadDelegateConfig {
         chunk_size: config.chunk_size.clone(),
@@ -53,24 +60,59 @@ pub async fn upload(config: Config) -> Result<(), Error> {
             err_if_directory(&path, &config)?;
 
             if path.is_dir() {
-                upload_directory(&hub, &config, delegate_config).await?;
+                upload_directory(&hub, &config, delegate_config)
+                    .await
+                    .map_err(|err| CommonError::Generic(err.to_string()))?;
             } else {
-                upload_regular(&hub, &config, delegate_config).await?;
+                upload_regular(&hub, &config, delegate_config)
+                    .await
+                    .map_err(|err| CommonError::Generic(err.to_string()))?;
             }
-        },
+        }
         None => {
             let tmp_file = file_helper::stdin_to_file()
-                .map_err(|err| Error::OpenFile(PathBuf::from("<stdin>"), err))?;
+                .map_err(|err| CommonError::Generic(err.to_string()))?;
 
-            upload_regular(&hub, &Config {
-                file_path: Some(tmp_file.as_ref().to_path_buf()),
-                ..config
-            }, delegate_config).await?;
+            upload_regular(
+                &hub,
+                &Config {
+                    file_path: Some(tmp_file.as_ref().to_path_buf()),
+                    ..config
+                },
+                delegate_config,
+            )
+            .await
+            .map_err(|err| CommonError::Generic(err.to_string()))?;
         }
     };
 
     Ok(())
 }
+
+async fn config_to_use(hub: &Hub, config: Config) -> Result<Config, CommonError> {
+    if let Some(ref paths) = config.parent_paths {
+        if config.parents.is_some() {
+            return Err(CommonError::Generic(
+                "Only one of --parent or --parent-path can be specified".to_string(),
+            ));
+        }
+        let mut parents = Vec::new();
+        for path in paths.iter() {
+            parents.push(drive_names::resolve(&hub, &path).await?);
+        }
+        Ok(Config {
+            parents: Some(parents),
+            ..config
+        })
+    } else if config.parents.is_none() {
+        Err(CommonError::Generic(
+            "Must pass one of --parent or --parent-path".to_string(),
+        ))
+    } else {
+        Ok(config)
+    }
+}
+
 
 pub async fn upload_regular(
     hub: &Hub,
@@ -78,8 +120,7 @@ pub async fn upload_regular(
     delegate_config: UploadDelegateConfig,
 ) -> Result<(), Error> {
     let file_path = config.file_path.as_ref().unwrap();
-    let file = fs::File::open(file_path)
-        .map_err(|err| Error::OpenFile(file_path.clone(), err))?;
+    let file = fs::File::open(file_path).map_err(|err| Error::OpenFile(file_path.clone(), err))?;
 
     let file_info = FileInfo::from_file(
         &file,
@@ -283,9 +324,12 @@ impl Display for Error {
     }
 }
 
-fn err_if_directory(path: &PathBuf, config: &Config) -> Result<(), Error> {
+fn err_if_directory(path: &PathBuf, config: &Config) -> Result<(), CommonError> {
     if path.is_dir() && !config.upload_directories {
-        Err(Error::IsDirectory(path.clone()))
+        Err(CommonError::Generic(format!(
+            "{}: exists and is not a directory, use --sync to replace",
+            path.display()
+        )))
     } else {
         Ok(())
     }
