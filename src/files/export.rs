@@ -3,6 +3,7 @@ use mime::Mime;
 use crate::common::drive_file;
 use crate::common::drive_file::DocType;
 use crate::common::drive_file::FileExtension;
+use crate::common::error::CommonError;
 use crate::common::hub_helper;
 use crate::files;
 use crate::hub::Hub;
@@ -91,7 +92,7 @@ pub enum Error {
     UnsupportedDriveMime(String),
     GetFileExtensionMime(drive_file::FileExtension),
     UnsupportedExportExtension(DocType),
-    SaveFile(files::download::Error),
+    SaveFile(CommonError),
 }
 
 impl error::Error for Error {}

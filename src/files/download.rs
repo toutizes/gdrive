@@ -1,5 +1,6 @@
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
+use crate::common::error::CommonError;
 use crate::common::hub_helper;
 use crate::common::md5_writer::Md5Writer;
 use crate::files;
@@ -11,8 +12,6 @@ use futures::stream::StreamExt;
 use google_drive3::hyper;
 use human_bytes::human_bytes;
 use std::collections::HashSet;
-use std::error;
-use std::fmt::{Display, Formatter};
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -50,13 +49,13 @@ pub enum ExistingFileAction {
     SyncLocal,
 }
 
-pub async fn download(config: Config) -> Result<(), Error> {
-    let hub = Arc::new(hub_helper::get_hub().await.map_err(Error::Hub)?);
+pub async fn download(config: Config) -> Result<(), CommonError> {
+    let hub = Arc::new(hub_helper::get_hub().await.map_err(CommonError::Hub)?);
 
     let file_id: String;
     if let Some(ref id) = config.file_id {
         if config.file_name.is_some() {
-            return Err(Error::Generic(
+            return Err(CommonError::Generic(
                 "Only one of file_id or file_name can be specified".to_string(),
             ));
         }
@@ -64,18 +63,18 @@ pub async fn download(config: Config) -> Result<(), Error> {
     } else if let Some(ref name) = config.file_name {
         file_id = drive_names::resolve(&hub, &name)
             .await
-            .map_err(|err| Error::Generic(err.to_string()))?;
+            .map_err(|err| CommonError::Generic(err.to_string()))?;
     } else {
-        return Err(Error::Generic(
+        return Err(CommonError::Generic(
             "Either file_id or file_name must be specified".to_string(),
         ));
     }
 
     let file = files::info::get_file(&hub, &file_id)
         .await
-        .map_err(Error::GetFile)?;
-    let item =
-        DriveItem::from_drive_file(&file).map_err(|err| Error::Generic(format!("{}", err)))?;
+        .map_err(CommonError::GetFile)?;
+    let item = DriveItem::from_drive_file(&file)
+        .map_err(|err| CommonError::Generic(format!("{}", err)))?;
 
     let dest: Option<PathBuf>;
     match &config.destination {
@@ -127,7 +126,7 @@ impl DownloadTask {
         }
     }
 
-    pub async fn download(&self) -> Result<(), Error> {
+    pub async fn download(&self) -> Result<(), CommonError> {
         match &self.item.details {
             DriveItemDetails::Directory {} => {
                 self.download_directory().await?;
@@ -142,9 +141,9 @@ impl DownloadTask {
         Ok(())
     }
 
-    async fn download_directory(&self) -> Result<(), Error> {
+    async fn download_directory(&self) -> Result<(), CommonError> {
         if !self.context.options.download_directories {
-            return Err(Error::Generic(format!(
+            return Err(CommonError::Generic(format!(
                 "{}: drive file is a directory, use --recursive to download directories",
                 self.item.name,
             )));
@@ -153,7 +152,7 @@ impl DownloadTask {
         let filepath: &PathBuf = self
             .filepath
             .as_ref()
-            .ok_or(Error::Generic(
+            .ok_or(CommonError::Generic(
                 "Directories cannot be downloaded to stdout".to_string(),
             ))
             .unwrap();
@@ -171,15 +170,15 @@ impl DownloadTask {
             },
         )
         .await
-        .map_err(|err| Error::Generic(format!("{}", err)))?;
+        .map_err(|err| CommonError::Generic(format!("{}", err)))?;
 
         // Use to collect the existing drive files if we want to delete
         // the extra local files later.
         let mut keep_names: HashSet<String> = HashSet::new();
 
         for file in &files {
-            let item_result =
-                DriveItem::from_drive_file(&file).map_err(|err| Error::Generic(format!("{}", err)));
+            let item_result = DriveItem::from_drive_file(&file)
+                .map_err(|err| CommonError::Generic(format!("{}", err)));
             match item_result {
                 Ok(item) => {
                     keep_names.insert(item.name.clone());
@@ -201,26 +200,26 @@ impl DownloadTask {
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
         if self.context.options.existing_file_action == ExistingFileAction::SyncLocal {
             delete_extra_local_files(filepath, &keep_names)
-                .map_err(|err| Error::Generic(format!("{}", err)))?;
+                .map_err(|err| CommonError::Generic(format!("{}", err)))?;
         }
 
         *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(0);
         Ok(())
     }
 
-    async fn download_file(&self, md5: &String) -> Result<(), Error> {
+    async fn download_file(&self, md5: &String) -> Result<(), CommonError> {
         match &self.filepath {
             Some(filepath) => {
                 let options = &self.context.options;
                 if filepath.exists() {
                     if filepath.is_dir() {
-                        return Err(Error::Generic(format!(
+                        return Err(CommonError::Generic(format!(
                             "{}: this drive file exists as a local directory, not downloaded",
                             filepath.display()
                         )));
                     }
                     if options.existing_file_action == ExistingFileAction::Abort {
-                        return Err(Error::FileExists(filepath.clone()));
+                        return Err(CommonError::FileExists(filepath.clone()));
                     }
                     if local_file_is_identical(filepath, md5) {
                         return Ok(());
@@ -229,7 +228,7 @@ impl DownloadTask {
                 let start = Instant::now();
                 let body = download_file(&self.context.hub, &self.item.id)
                     .await
-                    .map_err(Error::DownloadFile)?;
+                    .map_err(CommonError::DownloadFile)?;
                 let file_bytes = save_body_to_file(body, &filepath, Some(md5.clone())).await?;
                 *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
                 let duration = start.elapsed();
@@ -238,19 +237,19 @@ impl DownloadTask {
             None => {
                 let body = download_file(&self.context.hub, &self.item.id)
                     .await
-                    .map_err(Error::DownloadFile)?;
+                    .map_err(CommonError::DownloadFile)?;
                 save_body_to_stdout(body).await?;
             }
         };
         Ok(())
     }
 
-    async fn download_shortcut(&self, target_id: &String) -> Result<(), Error> {
+    async fn download_shortcut(&self, target_id: &String) -> Result<(), CommonError> {
         let target_file = files::info::get_file(&self.context.hub, target_id)
             .await
-            .map_err(Error::GetFile)?;
+            .map_err(CommonError::GetFile)?;
         let target_item = DriveItem::from_drive_file(&target_file)
-            .map_err(|err| Error::Generic(format!("{}", err)))?;
+            .map_err(|err| CommonError::Generic(format!("{}", err)))?;
         self.context.tm.add_task(Box::new(DownloadTask::new(
             self.context.clone(),
             target_item,
@@ -278,17 +277,17 @@ impl DriveTask for DownloadTask {
     }
 }
 
-fn create_dir_if_needed(path: &PathBuf) -> Result<usize, Error> {
+fn create_dir_if_needed(path: &PathBuf) -> Result<usize, CommonError> {
     // Only create the directory if it doesn't exist
     if !path.exists() {
         println!("{}: created directory", path.display());
-        fs::create_dir_all(&path).map_err(|err| Error::CreateDirectory(path.clone(), err))?;
+        fs::create_dir_all(&path).map_err(|err| CommonError::CreateDirectory(path.clone(), err))?;
     } else {
         let file_type = fs::metadata(&path)
-            .map_err(|err| Error::CreateDirectory(path.clone(), err))?
+            .map_err(|err| CommonError::CreateDirectory(path.clone(), err))?
             .file_type();
         if !file_type.is_dir() {
-            return Err(Error::IsNotDirectory(path.display().to_string()));
+            return Err(CommonError::IsNotDirectory(path.display().to_string()));
         }
     }
     Ok(1)
@@ -353,7 +352,10 @@ pub fn report_stats(
     );
 }
 
-pub async fn download_file(hub: &Hub, file_id: &str) -> Result<hyper::Body, google_drive3::Error> {
+pub async fn download_file(
+    hub: &Hub,
+    file_id: &str,
+) -> Result<hyper::Body, google_drive3::Error> {
     let (response, _) = hub
         .files()
         .get(file_id)
@@ -366,120 +368,15 @@ pub async fn download_file(hub: &Hub, file_id: &str) -> Result<hyper::Body, goog
     Ok(response.into_body())
 }
 
-#[derive(Debug)]
-pub enum Error {
-    Hub(hub_helper::Error),
-    GetFile(google_drive3::Error),
-    DownloadFile(google_drive3::Error),
-    MissingFileName,
-    FileExists(PathBuf),
-    IsDirectory(String),
-    IsNotDirectory(String),
-    Md5Mismatch { expected: String, actual: String },
-    CreateFile(io::Error),
-    CreateDirectory(PathBuf, io::Error),
-    CopyFile(io::Error),
-    RenameFile(io::Error),
-    ReadChunk(hyper::Error),
-    ReadDirectory(PathBuf, io::Error),
-    WriteChunk(io::Error),
-    // CreateFileTree(file_tree_drive::Error),
-    DestinationPathDoesNotExist(PathBuf),
-    DestinationPathNotADirectory(PathBuf),
-    CanonicalizeDestinationPath(PathBuf, io::Error),
-    MissingShortcutTarget,
-    IsShortcut(String),
-    StdoutNotValidDestination,
-    Generic(String),
-}
-
-impl error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Hub(err) => write!(f, "{}", err),
-            Error::GetFile(err) => write!(f, "Failed getting file: {}", err),
-            Error::DownloadFile(err) => write!(f, "Failed to download file: {}", err),
-            Error::MissingFileName => write!(f, "File does not have a name"),
-            Error::FileExists(path) => write!(
-                f,
-                "File '{}' already exists, use --overwrite to overwrite it",
-                path.display()
-            ),
-            Error::IsDirectory(name) => write!(
-                f,
-                "'{}' is a directory, use --recursive to download directories",
-                name
-            ),
-            Error::IsNotDirectory(name) => write!(
-                f,
-                "'{}' exists and is not a directory, use --sync to replace",
-                name
-            ),
-            Error::Md5Mismatch { expected, actual } => {
-                // fmt
-                write!(
-                    f,
-                    "MD5 mismatch, expected: {}, actual: {}",
-                    expected, actual
-                )
-            }
-            Error::CreateFile(err) => write!(f, "Failed to create file: {}", err),
-            Error::CreateDirectory(path, err) => write!(
-                f,
-                "Failed to create directory '{}': {}",
-                path.display(),
-                err
-            ),
-            Error::CopyFile(err) => write!(f, "Failed to copy file: {}", err),
-            Error::ReadDirectory(path, err) => {
-                write!(f, "Failed to read directory '{}': {}", path.display(), err)
-            }
-            Error::RenameFile(err) => write!(f, "Failed to rename file: {}", err),
-            Error::ReadChunk(err) => write!(f, "Failed read from stream: {}", err),
-            Error::WriteChunk(err) => write!(f, "Failed write to file: {}", err),
-            // Error::CreateFileTree(err) => write!(f, "Failed to create file tree: {}", err),
-            Error::DestinationPathDoesNotExist(path) => {
-                write!(f, "Destination path '{}' does not exist", path.display())
-            }
-            Error::DestinationPathNotADirectory(path) => {
-                write!(
-                    f,
-                    "Destination path '{}' is not a directory",
-                    path.display()
-                )
-            }
-            Error::CanonicalizeDestinationPath(path, err) => write!(
-                f,
-                "Failed to canonicalize destination path '{}': {}",
-                path.display(),
-                err
-            ),
-            Error::MissingShortcutTarget => write!(f, "Shortcut does not have a target"),
-            Error::IsShortcut(name) => write!(
-                f,
-                "'{}' is a shortcut, use --follow-shortcuts to download the file it points to",
-                name
-            ),
-            Error::StdoutNotValidDestination => write!(
-                f,
-                "Stdout is not a valid destination for this combination of options"
-            ),
-            Error::Generic(s) => write!(f, "{}", s),
-        }
-    }
-}
-
 // TODO: move to common
 pub async fn save_body_to_file(
     mut body: hyper::Body,
     file_path: &PathBuf,
     expected_md5: Option<String>,
-) -> Result<usize, Error> {
+) -> Result<usize, CommonError> {
     // Create temporary file
     let tmp_file_path = file_path.with_extension("incomplete");
-    let file = File::create(&tmp_file_path).map_err(Error::CreateFile)?;
+    let file = File::create(&tmp_file_path).map_err(CommonError::CreateFile)?;
 
     // Wrap file in writer that calculates md5
     let mut writer = Md5Writer::new(file);
@@ -487,8 +384,8 @@ pub async fn save_body_to_file(
 
     // Read chunks from stream and write to file
     while let Some(chunk_result) = body.next().await {
-        let chunk = chunk_result.map_err(Error::ReadChunk)?;
-        writer.write_all(&chunk).map_err(Error::WriteChunk)?;
+        let chunk = chunk_result.map_err(CommonError::ReadChunk)?;
+        writer.write_all(&chunk).map_err(CommonError::WriteChunk)?;
         written_bytes += chunk.len();
     }
 
@@ -496,31 +393,31 @@ pub async fn save_body_to_file(
     err_if_md5_mismatch(expected_md5, writer.md5())?;
 
     // Rename temporary file to final file
-    fs::rename(&tmp_file_path, &file_path).map_err(Error::RenameFile)?;
+    fs::rename(&tmp_file_path, &file_path).map_err(CommonError::RenameFile)?;
 
     Ok(written_bytes)
 }
 
 // TODO: move to common
-pub async fn save_body_to_stdout(mut body: hyper::Body) -> Result<(), Error> {
+pub async fn save_body_to_stdout(mut body: hyper::Body) -> Result<(), CommonError> {
     let mut stdout = io::stdout();
 
     // Read chunks from stream and write to stdout
     while let Some(chunk_result) = body.next().await {
-        let chunk = chunk_result.map_err(Error::ReadChunk)?;
-        stdout.write_all(&chunk).map_err(Error::WriteChunk)?;
+        let chunk = chunk_result.map_err(CommonError::ReadChunk)?;
+        stdout.write_all(&chunk).map_err(CommonError::WriteChunk)?;
     }
 
     Ok(())
 }
 
-fn err_if_md5_mismatch(expected: Option<String>, actual: String) -> Result<(), Error> {
+fn err_if_md5_mismatch(expected: Option<String>, actual: String) -> Result<(), CommonError> {
     let is_matching = expected.clone().map(|md5| md5 == actual).unwrap_or(true);
 
     if is_matching {
         Ok(())
     } else {
-        Err(Error::Md5Mismatch {
+        Err(CommonError::Md5Mismatch {
             expected: expected.unwrap_or_default(),
             actual,
         })
@@ -531,7 +428,7 @@ fn local_file_is_identical(path: &PathBuf, drive_md5: &String) -> bool {
     if path.exists() {
         let file_md5 = compute_md5_from_path(path).unwrap_or_else(|err| {
             eprintln!(
-                "Warning: Error while computing md5 of '{}': {}",
+                "Warning: CommonError while computing md5 of '{}': {}",
                 path.display(),
                 err
             );
