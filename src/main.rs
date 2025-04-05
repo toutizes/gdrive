@@ -211,6 +211,7 @@ enum FileCommand {
         parent_path: Option<Vec<String>>,
 
         /// Upload directories. Note that this will always create a new directory on drive and will not update existing directories with the same name
+        // TODO: add --overwrite and --sync
         #[arg(long)]
         recursive: bool,
 
@@ -229,6 +230,8 @@ enum FileCommand {
         /// Print only id of file/folder
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
+
+        // TODO: add --overwrite and --sync
     },
 
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
