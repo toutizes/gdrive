@@ -51,4 +51,10 @@ impl DiskItem {
             name: Some(entry.file_name().to_string_lossy().to_string()),
         })
     }
+
+    pub fn require_name(&self) -> Result<&String, CommonError> {
+        self.name
+            .as_ref()
+            .ok_or_else(|| CommonError::Generic("File name is required".to_string()))
+    }
 }

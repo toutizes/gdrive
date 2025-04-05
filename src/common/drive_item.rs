@@ -1,5 +1,8 @@
+use crate::common::disk_item::DiskItem;
 use crate::common::drive_file;
 use crate::common::error::CommonError;
+use crate::files::list;
+use crate::hub::Hub;
 
 pub enum DriveItemDetails {
     Directory {},
@@ -36,8 +39,8 @@ impl DriveItem {
             details = get_file_shortcut_details(&file)?;
         } else {
             return Err(CommonError::Generic(format!(
-                "Unknown file type: {:?}",
-                file
+                "Unknown file type: mime_type {:?}, md5 {:?}",
+                file.mime_type, file.md5_checksum,
             )));
         }
 
@@ -47,6 +50,61 @@ impl DriveItem {
             parent: get_file_parent(&file)?,
             details,
         });
+    }
+
+    pub async fn list_drive_dir(
+        hub: &Hub,
+        parent_id: &Option<String>,
+    ) -> Result<Vec<DriveItem>, CommonError> {
+        let query: list::ListQuery;
+        if let Some(ref id) = parent_id {
+            query = list::ListQuery::FilesInFolder {
+                folder_id: id.clone(),
+            };
+        } else {
+            query = list::ListQuery::RootNotTrashed;
+        }
+        let files = list::list_files(
+            hub,
+            &list::ListFilesConfig {
+                query,
+                order_by: Default::default(),
+                max_files: usize::MAX,
+            },
+        )
+        .await
+        .map_err(|err| CommonError::Generic(format!("{}", err)))?;
+
+        let mut drive_items = Vec::new();
+
+        for file in &files {
+            let item_or = DriveItem::from_drive_file(&file);
+            match item_or {
+                Ok(item) => {
+                    drive_items.push(item);
+                }
+                Err(err) => {
+                    println!("Ignoring drive item: {:?}", err);
+                }
+            }
+        }
+
+        Ok(drive_items)
+    }
+
+    pub async fn from_disk_item(
+        hub: &Hub,
+        disk_item: &DiskItem,
+        parent_id: &Option<String>,
+    ) -> Result<Option<DriveItem>, CommonError> {
+        let name = disk_item.require_name()?;
+        let items = DriveItem::list_drive_dir(hub, parent_id).await?;
+        for item in items {
+            if &item.name == name {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -104,8 +162,18 @@ macro_rules! get_shortcut_property {
     };
 }
 
-get_shortcut_property!(get_shortcut_target_id, target_id, String, "Missing target id: {:?}");
-get_shortcut_property!(get_shortcut_target_mime_type, target_mime_type, String, "Missing target id: {:?}");
+get_shortcut_property!(
+    get_shortcut_target_id,
+    target_id,
+    String,
+    "Missing target id: {:?}"
+);
+get_shortcut_property!(
+    get_shortcut_target_mime_type,
+    target_mime_type,
+    String,
+    "Missing target id: {:?}"
+);
 
 fn get_file_shortcut_details(
     file: &google_drive3::api::File,

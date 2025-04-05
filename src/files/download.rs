@@ -4,7 +4,6 @@ use crate::common::drive_names;
 use crate::common::error::CommonError;
 use crate::common::hub_helper;
 use crate::files;
-use crate::files::list;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
 use async_trait::async_trait;
@@ -210,43 +209,23 @@ impl DownloadTask {
 
         let num_dirs_created = create_dir_if_needed(filepath)?;
 
-        let files = list::list_files(
-            &self.context.hub,
-            &list::ListFilesConfig {
-                query: list::ListQuery::FilesInFolder {
-                    folder_id: self.item.id.clone(),
-                },
-                order_by: Default::default(),
-                max_files: usize::MAX,
-            },
-        )
-        .await
-        .map_err(|err| CommonError::Generic(format!("{}", err)))?;
+        let items = DriveItem::list_drive_dir(&self.context.hub, &Some(self.item.id.clone())).await?;
 
         // Use to collect the existing drive files if we want to delete
         // the extra local files later.
         let mut keep_names: HashSet<String> = HashSet::new();
 
-        for file in &files {
-            let item_result = DriveItem::from_drive_file(&file)
-                .map_err(|err| CommonError::Generic(format!("{}", err)));
-            match item_result {
-                Ok(item) => {
-                    keep_names.insert(item.name.clone());
-
-                    let itempath = Some(filepath.join(&item.name));
-
-                    self.context.tm.add_task(DownloadTask::new(
-                        self.context.clone(),
-                        item,
-                        itempath,
-                    ));
-                }
-                Err(err) => {
-                    println!("{:?}: {}", file.name, err.to_string());
-                }
-            }
-        }
+        for item in items {
+            keep_names.insert(item.name.clone());
+            
+            let itempath = Some(filepath.join(&item.name));
+            
+            self.context.tm.add_task(DownloadTask::new(
+                self.context.clone(),
+                item,
+                itempath,
+            ));
+         }
 
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
         let mut num_files_deleted: usize = 0;

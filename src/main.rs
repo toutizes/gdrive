@@ -215,6 +215,14 @@ enum FileCommand {
         #[arg(long)]
         recursive: bool,
 
+        #[arg(long, value_enum, default_value_t = files::upload::ExistingDriveFileAction::Skip,
+              help = "What to do if a file with the same name already exists in Google Drive:\n\
+ - skip: skip uploading the local file, the Drive file will not be modified.\n\
+ - replace: replace the existing Drive file with the local file.\n\
+ - upload-anyway: ignore the existing Drive file and upload the local file anyway. You end up with two files with the same name in Google Drive.\n\
+ - sync: like `replace` but also deletes files from Google Drive if they do not exist locally.\n")]
+        existing_file_action: files::upload::ExistingDriveFileAction,
+
         /// Set chunk size in MB, must be a power of two.
         #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
         chunk_size: ChunkSize,
@@ -230,7 +238,6 @@ enum FileCommand {
         /// Print only id of file/folder
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
-
         // TODO: add --overwrite and --sync
     },
 
@@ -559,6 +566,7 @@ async fn main() {
                     parent,
                     parent_path,
                     recursive,
+                    existing_file_action,
                     chunk_size,
                     print_chunk_errors,
                     print_chunk_info,
@@ -567,14 +575,17 @@ async fn main() {
                     // fmt
                     files::upload(files::upload::Config {
                         file_path,
-                        mime_type: mime,
                         parents: parent,
                         parent_paths: parent_path,
                         chunk_size,
                         print_chunk_errors,
                         print_chunk_info,
-                        upload_directories: recursive,
                         print_only_id,
+                        options: files::upload::UploadOptions {
+                            existing_file_action,
+                            upload_directories: recursive,
+                            force_mime_type: mime,
+                        },
                     })
                     .await
                     .unwrap_or_else(handle_error)

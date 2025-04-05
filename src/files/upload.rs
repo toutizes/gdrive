@@ -3,6 +3,7 @@ use crate::common::delegate::ChunkSize;
 use crate::common::delegate::UploadDelegate;
 use crate::common::delegate::UploadDelegateConfig;
 use crate::common::disk_item::DiskItem;
+use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
 use crate::common::error::CommonError;
 use crate::common::file_helper;
@@ -18,6 +19,7 @@ use crate::files::mkdir;
 use crate::files::tasks::{DriveTask, DriveTaskStatus};
 use crate::hub::Hub;
 use async_trait::async_trait;
+use clap::ValueEnum;
 use human_bytes::human_bytes;
 use mime::Mime;
 use std::error;
@@ -29,16 +31,30 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[derive(Debug, Clone, ValueEnum)]
+pub enum ExistingDriveFileAction {
+    Skip,
+    Replace,
+    UploadAnyway,
+    Sync,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadOptions {
+    pub existing_file_action: ExistingDriveFileAction,
+    pub upload_directories: bool,
+    pub force_mime_type: Option<Mime>,
+}
+
 pub struct Config {
     pub file_path: Option<PathBuf>,
-    pub mime_type: Option<Mime>,
     pub parents: Option<Vec<String>>,
     pub parent_paths: Option<Vec<String>>,
     pub chunk_size: ChunkSize,
     pub print_chunk_errors: bool,
     pub print_chunk_info: bool,
-    pub upload_directories: bool,
     pub print_only_id: bool,
+    pub options: UploadOptions,
 }
 
 pub async fn upload(cl_config: Config) -> Result<(), CommonError> {
@@ -119,28 +135,19 @@ async fn config_to_use(hub: &Hub, config: Config) -> Result<Config, CommonError>
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum ExistingDriveFileAction {
-    Abort,
-    Ignore,
-    Overwrite,
-    SyncDrive,
-}
-
 #[derive(Clone)]
 pub struct UploadContext {
     hub: Arc<Hub>,
     // tm: Arc<TaskManager<UploadTask>>,
-    // existing_file_action: ExistingDriveFileAction,
-    // upload_directories: bool,
-    force_mime_type: Option<Mime>,
     delegate_config: UploadDelegateConfig,
+    options: UploadOptions,
 }
 
 pub struct UploadTask {
     context: UploadContext,
     item: DiskItem,
     parent_id: Vec<String>,
+    existing_item: Option<DriveItem>,
     status: Mutex<DriveTaskStatus>,
     // stats: Mutex<UploadStats>,
 }
@@ -155,11 +162,17 @@ pub struct UploadStats {
 }
 
 impl UploadTask {
-    pub fn new(context: UploadContext, item: DiskItem, parent_id: Vec<String>) -> Self {
+    pub fn new(
+        context: UploadContext,
+        item: DiskItem,
+        parent_id: Vec<String>,
+        existing_item: Option<DriveItem>,
+    ) -> Self {
         Self {
             context,
             item,
             parent_id,
+            existing_item,
             status: Mutex::new(DriveTaskStatus::Pending),
             // stats: Mutex::new(UploadStats {
             //     num_files: 0,
@@ -175,7 +188,7 @@ impl UploadTask {
         if self.item.path.is_dir() {
             self.do_upload_directory().await
         } else if self.item.path.is_file() {
-            self.do_upload_file().await
+            self.maybe_upload_file().await
         } else {
             Err(CommonError::Generic(format!(
                 "{}: not a file or directory, skipped",
@@ -188,13 +201,42 @@ impl UploadTask {
         Ok(())
     }
 
+    async fn maybe_upload_file(&self) -> Result<(), CommonError> {
+        match &self.existing_item {
+            None => {
+                return self.do_upload_file().await;
+            }
+            Some(existing_item) => match &existing_item.details {
+                DriveItemDetails::File { .. } => match self.context.options.existing_file_action {
+                    ExistingDriveFileAction::Skip => {
+                        return Err(CommonError::Generic(format!(
+                            "{}: exists in Google Drive. Use --replace or --sync to replace",
+                            self.item.path.display()
+                        )));
+                    }
+                    ExistingDriveFileAction::Sync | ExistingDriveFileAction::Replace => {
+                        return Err(CommonError::Generic(format!(
+                            "{}: replacing existing file not implemented yet",
+                            self.item.path.display()
+                        )));
+                    }
+                    ExistingDriveFileAction::UploadAnyway => {
+                        return self.do_upload_file().await;
+                    }
+                },
+                _ => {
+                    return Err(CommonError::Generic(format!(
+                        "{}: is a directory or shortcut on Google Drive, skipping",
+                        self.item.path.display()
+                    )));
+                }
+            },
+        }
+    }
+
     async fn do_upload_file(&self) -> Result<(), CommonError> {
         // For a file, name has to be specified. (Empty name is root /)
-        let name = self
-            .item
-            .name
-            .as_ref()
-            .ok_or_else(|| CommonError::Generic("File name is required".to_string()))?;
+        let name = self.item.require_name()?;
 
         let file = std::fs::File::open(&self.item.path).map_err(|err| {
             CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
@@ -204,11 +246,16 @@ impl UploadTask {
             CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
         })?;
 
-        let mime_type = self.context.force_mime_type.clone().unwrap_or_else(|| {
-            mime_guess::from_path(&self.item.path)
-                .first()
-                .unwrap_or(mime::APPLICATION_OCTET_STREAM)
-        });
+        let mime_type = self
+            .context
+            .options
+            .force_mime_type
+            .clone()
+            .unwrap_or_else(|| {
+                mime_guess::from_path(&self.item.path)
+                    .first()
+                    .unwrap_or(mime::APPLICATION_OCTET_STREAM)
+            });
 
         let file_info = FileInfo {
             name: name.clone(),
@@ -251,6 +298,15 @@ impl DriveTask for UploadTask {
     }
 }
 
+fn single_parent(config: &Config) -> Option<String> {
+    if let Some(parents) = &config.parents {
+        if parents.len() == 1 {
+            return parents.first().cloned();
+        }
+    }
+    None
+}
+
 pub async fn upload_regular(
     hub: Arc<Hub>,
     config: &Config,
@@ -260,18 +316,18 @@ pub async fn upload_regular(
         return Err(CommonError::Generic("File path is required".to_string()));
     }
     let item = DiskItem::for_path(&config.file_path.as_ref().unwrap())?;
+    let drive_item = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
 
     let task = UploadTask::new(
         UploadContext {
             hub: hub.clone(),
             // tm: Arc::new(TaskManager::new()),
-            // existing_file_action: ExistingDriveFileAction::Ignore,
-            // upload_directories: config.upload_directories,
-            force_mime_type: config.mime_type.clone(),
             delegate_config,
+            options: config.options.clone(),
         },
         item,
         config.parents.clone().unwrap_or_default(),
+        drive_item,
     );
 
     task.process().await;
@@ -454,7 +510,7 @@ impl Display for Error {
 }
 
 fn err_if_directory(path: &PathBuf, config: &Config) -> Result<(), CommonError> {
-    if path.is_dir() && !config.upload_directories {
+    if path.is_dir() && !config.options.upload_directories {
         Err(CommonError::Generic(format!(
             "{}: is a directory, use --recursive to upload",
             path.display()
