@@ -96,15 +96,29 @@ impl DriveItem {
         hub: &Hub,
         disk_item: &DiskItem,
         parent_id: &Option<String>,
-    ) -> Result<Option<DriveItem>, CommonError> {
+    ) -> Result<Vec<DriveItem>, CommonError> {
         let name = disk_item.require_name()?;
+        let mut named_items = Vec::new();
         let items = DriveItem::list_drive_dir(hub, parent_id).await?;
         for item in items {
             if &item.name == name {
-                return Ok(Some(item));
+                named_items.push(item);
             }
         }
-        Ok(None)
+        Ok(named_items)
+    }
+
+    pub fn file_mime_type(&self) -> Result<&String, CommonError> {
+        match &self.details {
+            DriveItemDetails::File { mime_type, .. } => Ok(mime_type),
+            DriveItemDetails::Shortcut {
+                target_mime_type, ..
+            } => Ok(target_mime_type),
+            _ => Err(CommonError::Generic(format!(
+                "{}: is a directory on Google Drive",
+                self.name
+            ))),
+        }
     }
 }
 

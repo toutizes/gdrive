@@ -28,6 +28,7 @@ use std::fmt::Formatter;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -147,7 +148,8 @@ pub struct UploadTask {
     context: UploadContext,
     item: DiskItem,
     parent_id: Vec<String>,
-    existing_item: Option<DriveItem>,
+    // List of items with the name item.name in the parent_id folder.
+    existing_items: Vec<DriveItem>,
     status: Mutex<DriveTaskStatus>,
     // stats: Mutex<UploadStats>,
 }
@@ -166,13 +168,13 @@ impl UploadTask {
         context: UploadContext,
         item: DiskItem,
         parent_id: Vec<String>,
-        existing_item: Option<DriveItem>,
+        existing_items: Vec<DriveItem>,
     ) -> Self {
         Self {
             context,
             item,
             parent_id,
-            existing_item,
+            existing_items,
             status: Mutex::new(DriveTaskStatus::Pending),
             // stats: Mutex::new(UploadStats {
             //     num_files: 0,
@@ -202,36 +204,52 @@ impl UploadTask {
     }
 
     async fn maybe_upload_file(&self) -> Result<(), CommonError> {
-        match &self.existing_item {
-            None => {
+        if self.existing_items.is_empty() {
+            return self.do_upload_file().await;
+        }
+        match self.context.options.existing_file_action {
+            ExistingDriveFileAction::Skip => {
+                println!(
+                    "{}: exists in Google Drive, skipped. Use --replace or --sync to replace",
+                    self.item.path.display()
+                );
+                return Ok(());
+            }
+            ExistingDriveFileAction::Sync | ExistingDriveFileAction::Replace => {
+                return self.handle_existing_items().await;
+            }
+            ExistingDriveFileAction::UploadAnyway => {
                 return self.do_upload_file().await;
             }
-            Some(existing_item) => match &existing_item.details {
-                DriveItemDetails::File { .. } => match self.context.options.existing_file_action {
-                    ExistingDriveFileAction::Skip => {
-                        return Err(CommonError::Generic(format!(
-                            "{}: exists in Google Drive. Use --replace or --sync to replace",
-                            self.item.path.display()
-                        )));
-                    }
-                    ExistingDriveFileAction::Sync | ExistingDriveFileAction::Replace => {
-                        return Err(CommonError::Generic(format!(
-                            "{}: replacing existing file not implemented yet",
-                            self.item.path.display()
-                        )));
-                    }
-                    ExistingDriveFileAction::UploadAnyway => {
-                        return self.do_upload_file().await;
-                    }
-                },
-                _ => {
+        }
+    }
+
+    // Handle uploading an item when one or more exist with the same name
+    // on disk.
+    async fn handle_existing_items(&self) -> Result<(), CommonError> {
+        // Abort if any is not a file
+        for item in &self.existing_items {
+            match item.details {
+                DriveItemDetails::File { .. } => {}
+                DriveItemDetails::Directory { .. } => {
                     return Err(CommonError::Generic(format!(
-                        "{}: is a directory or shortcut on Google Drive, skipping",
+                        "{}: existing drive items is a folder, skipped",
                         self.item.path.display()
                     )));
                 }
-            },
+                DriveItemDetails::Shortcut { .. } => {
+                    return Err(CommonError::Generic(format!(
+                        "{}: existing drive items is a shortcut , skipped",
+                        self.item.path.display()
+                    )));
+                }
+            }
         }
+        // Update the first match.
+        // TODO: Find the best match?
+        // In "sync" delete the extra files.
+
+        return self.do_update_file(&self.existing_items[0]).await;
     }
 
     async fn do_upload_file(&self) -> Result<(), CommonError> {
@@ -278,6 +296,54 @@ impl UploadTask {
 
         Ok(())
     }
+
+    async fn do_update_file(&self, drive_item: &DriveItem) -> Result<(), CommonError> {
+        match &drive_item.details {
+            DriveItemDetails::File {
+                mime_type, size, ..
+            } => {
+                let mime_type_mime = Mime::from_str(&mime_type).map_err(|err| {
+                    CommonError::Generic(format!(
+                        "{}: invalid mime type {}",
+                        mime_type,
+                        err.to_string()
+                    ))
+                })?;
+                let file_info = FileInfo {
+                    name: drive_item.name.clone(),
+                    mime_type: mime_type_mime,
+                    parents: Some(self.parent_id.clone()),
+                    size: *size as u64,
+                };
+
+                let file = std::fs::File::open(&self.item.path).map_err(|err| {
+                    CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
+                })?;
+
+                let reader = std::io::BufReader::new(file);
+
+                let _drive_file = update_file(
+                    &self.context.hub,
+                    reader,
+                    &drive_item.id,
+                    file_info,
+                    self.context.delegate_config.clone(),
+                )
+                .await
+                .map_err(|err| {
+                    CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
+                })?;
+
+                Ok(())
+            }
+            DriveItemDetails::Directory { .. } | DriveItemDetails::Shortcut { .. } => {
+                return Err(CommonError::Generic(format!(
+                    "{}: existing drive items is not a file, skipped",
+                    self.item.path.display()
+                )));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -316,7 +382,7 @@ pub async fn upload_regular(
         return Err(CommonError::Generic("File path is required".to_string()));
     }
     let item = DiskItem::for_path(&config.file_path.as_ref().unwrap())?;
-    let drive_item = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
+    let existing_items = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
 
     let task = UploadTask::new(
         UploadContext {
@@ -327,7 +393,7 @@ pub async fn upload_regular(
         },
         item,
         config.parents.clone().unwrap_or_default(),
-        drive_item,
+        existing_items,
     );
 
     task.process().await;
@@ -464,6 +530,40 @@ where
         .supports_all_drives(true);
 
     let (_, file) = if file_info.size > chunk_size_bytes {
+        req.upload_resumable(src_file, file_info.mime_type).await?
+    } else {
+        req.upload(src_file, file_info.mime_type).await?
+    };
+
+    Ok(file)
+}
+
+pub async fn update_file<RS>(
+    hub: &Hub,
+    src_file: RS,
+    file_id: &String,
+    file_info: FileInfo,
+    delegate_config: UploadDelegateConfig,
+) -> Result<google_drive3::api::File, google_drive3::Error>
+where
+    RS: google_drive3::client::ReadSeek,
+{
+    let dst_file = google_drive3::api::File {
+        name: Some(file_info.name),
+        ..google_drive3::api::File::default()
+    };
+
+    let mut delegate = UploadDelegate::new(delegate_config);
+
+    let req = hub
+        .files()
+        .update(dst_file, &file_id)
+        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+        .add_scope(google_drive3::api::Scope::Full)
+        .delegate(&mut delegate)
+        .supports_all_drives(true);
+
+    let (_, file) = if file_info.size > 0 {
         req.upload_resumable(src_file, file_info.mime_type).await?
     } else {
         req.upload(src_file, file_info.mime_type).await?
