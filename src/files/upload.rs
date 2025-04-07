@@ -1,33 +1,18 @@
-use crate::common::delegate::BackoffConfig;
-use crate::common::delegate::ChunkSize;
-use crate::common::delegate::UploadDelegate;
-use crate::common::delegate::UploadDelegateConfig;
+use async_trait::async_trait;
+use clap::ValueEnum;
+use crate::common::delegate::{BackoffConfig, ChunkSize, UploadDelegate, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
 use crate::common::error::CommonError;
 use crate::common::file_helper;
-use crate::common::file_info;
 use crate::common::file_info::FileInfo;
-use crate::common::file_tree;
-// use crate::common::file_tree::FileTree;
 use crate::common::hub_helper;
-// use crate::common::id_gen::IdGen;
-// use crate::files;
-// use crate::files::info::DisplayConfig;
 use crate::files::mkdir;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
-use async_trait::async_trait;
-use clap::ValueEnum;
-// use human_bytes::human_bytes;
 use mime::Mime;
 use std::collections::HashMap;
-use std::error;
-use std::fmt::Display;
-use std::fmt::Formatter;
-// use std::fs;
-use std::io;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -450,34 +435,6 @@ fn single_parent(config: &Config) -> Option<String> {
     None
 }
 
-pub async fn upload_regular(
-    hub: Arc<Hub>,
-    config: &Config,
-    delegate_config: UploadDelegateConfig,
-) -> Result<(), CommonError> {
-    if config.file_path.is_none() {
-        return Err(CommonError::Generic("File path is required".to_string()));
-    }
-    let item = DiskItem::for_path(&config.file_path.as_ref().unwrap())?;
-    let existing_items = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
-
-    let task = UploadTask::new(
-        UploadContext {
-            hub: hub.clone(),
-            tm: Arc::new(TaskManager::new(config.workers)),
-            delegate_config,
-            options: config.options.clone(),
-        },
-        item,
-        config.parents.clone().unwrap_or_default(),
-        existing_items,
-    );
-
-    task.process().await;
-
-    Ok(())
-}
-
 pub async fn upload_item(
     hub: Arc<Hub>,
     config: Config,
@@ -581,51 +538,3 @@ where
 
     Ok(file)
 }
-
-#[derive(Debug)]
-pub enum Error {
-    Hub(hub_helper::Error),
-    FileInfo(file_info::Error),
-    OpenFile(PathBuf, io::Error),
-    Upload(google_drive3::Error),
-    IsDirectory(PathBuf),
-    DriveFolderMissingId,
-    CreateFileTree(file_tree::Error),
-    Mkdir(google_drive3::Error),
-    Generic(String),
-}
-
-impl error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Hub(err) => write!(f, "{}", err),
-            Error::FileInfo(err) => write!(f, "{}", err),
-            Error::OpenFile(path, err) => {
-                write!(f, "Failed to open file '{}': {}", path.display(), err)
-            }
-            Error::Upload(err) => write!(f, "Failed to upload file: {}", err),
-            Error::IsDirectory(path) => write!(
-                f,
-                "'{}' is a directory, use --recursive to upload directories",
-                path.display()
-            ),
-            Error::DriveFolderMissingId => write!(f, "Folder created on drive does not have an id"),
-            Error::CreateFileTree(err) => write!(f, "Failed to create file tree: {}", err),
-            Error::Mkdir(err) => write!(f, "Failed to create directory: {}", err),
-            Error::Generic(msg) => write!(f, "{}", msg),
-        }
-    }
-}
-
-// fn err_if_directory(path: &PathBuf, config: &Config) -> Result<(), CommonError> {
-//     if path.is_dir() && !config.options.upload_directories {
-//         Err(CommonError::Generic(format!(
-//             "{}: is a directory, use --recursive to upload",
-//             path.display()
-//         )))
-//     } else {
-//         Ok(())
-//     }
-// }
