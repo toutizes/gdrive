@@ -1,6 +1,7 @@
 use crate::common::delegate::UploadDelegateConfig;
 use crate::common::drive_file;
 use crate::common::drive_file::DocType;
+use crate::common::drive_item::DriveItem;
 use crate::common::file_info;
 use crate::common::file_info::FileInfo;
 use crate::common::hub_helper;
@@ -47,9 +48,9 @@ pub async fn import(config: Config) -> Result<(), Error> {
         println!("Importing {} as a {}", config.file_path.display(), doc_type);
     }
 
-    let file = files::upload::upload_file(&hub, reader, None, file_info, delegate_config)
+    let file = DriveItem::upload(&hub, reader, None, file_info, delegate_config)
         .await
-        .map_err(Error::UploadFile)?;
+        .map_err(|err| Error::Generic(err.to_string()))?;
 
     if config.print_only_id {
         print!("{}", file.id.unwrap_or_default())
@@ -70,6 +71,7 @@ pub enum Error {
     UploadFile(google_drive3::Error),
     UnsupportedFileType,
     GetMime(drive_file::DocType),
+    Generic(String),
 }
 
 impl error::Error for Error {}
@@ -95,6 +97,7 @@ impl Display for Error {
                 "Failed to get mime type from document type: {}",
                 doc_type
             ),
+            Error::Generic(err) => write!(f, "{}", err),
         }
     }
 }

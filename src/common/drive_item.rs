@@ -1,6 +1,8 @@
+use crate::common::delegate::{UploadDelegate, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_file;
 use crate::common::error::CommonError;
+use crate::common::file_info::FileInfo;
 use crate::files::list;
 use crate::hub::Hub;
 
@@ -121,6 +123,88 @@ impl DriveItem {
                 self.name
             ))),
         }
+    }
+
+    pub async fn upload<RS>(
+        hub: &Hub,
+        src_file: RS,
+        file_id: Option<String>,
+        file_info: FileInfo,
+        delegate_config: UploadDelegateConfig,
+    ) -> Result<google_drive3::api::File, CommonError>
+    where
+        RS: google_drive3::client::ReadSeek,
+    {
+        println!("Upload file: {:?}: {:?}", file_id, file_info.name);
+        let dst_file = google_drive3::api::File {
+            id: file_id,
+            name: Some(file_info.name),
+            mime_type: Some(file_info.mime_type.to_string()),
+            parents: file_info.parents,
+            ..google_drive3::api::File::default()
+        };
+
+        let chunk_size_bytes = delegate_config.chunk_size.in_bytes();
+        let mut delegate = UploadDelegate::new(delegate_config);
+
+        let req = hub
+        .files()
+        .create(dst_file)
+        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+        .add_scope(google_drive3::api::Scope::Full)
+        .delegate(&mut delegate)
+        .supports_all_drives(true);
+
+        let (_, file) = if file_info.size > chunk_size_bytes {
+            req.upload_resumable(src_file, file_info.mime_type)
+                .await
+                .map_err(|err| CommonError::Generic(err.to_string()))?
+        } else {
+            req.upload(src_file, file_info.mime_type)
+                .await
+                .map_err(|err| CommonError::Generic(err.to_string()))?
+        };
+
+        Ok(file)
+    }
+
+    pub async fn update<RS>(
+        &self,
+        hub: &Hub,
+        src_file: RS,
+        file_id: &String,
+        file_info: FileInfo,
+        delegate_config: UploadDelegateConfig,
+    ) -> Result<google_drive3::api::File, CommonError>
+    where
+        RS: google_drive3::client::ReadSeek,
+    {
+        let dst_file = google_drive3::api::File {
+            name: Some(file_info.name),
+            ..google_drive3::api::File::default()
+        };
+
+        let mut delegate = UploadDelegate::new(delegate_config);
+
+        let req = hub
+        .files()
+        .update(dst_file, &file_id)
+        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+        .add_scope(google_drive3::api::Scope::Full)
+        .delegate(&mut delegate)
+        .supports_all_drives(true);
+
+        let (_, file) = if file_info.size > 0 {
+            req.upload_resumable(src_file, file_info.mime_type)
+                .await
+                .map_err(|err| CommonError::Generic(err.to_string()))?
+        } else {
+            req.upload(src_file, file_info.mime_type)
+                .await
+                .map_err(|err| CommonError::Generic(err.to_string()))?
+        };
+
+        Ok(file)
     }
 }
 

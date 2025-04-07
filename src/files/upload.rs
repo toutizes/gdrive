@@ -1,6 +1,4 @@
-use async_trait::async_trait;
-use clap::ValueEnum;
-use crate::common::delegate::{BackoffConfig, ChunkSize, UploadDelegate, UploadDelegateConfig};
+use crate::common::delegate::{BackoffConfig, ChunkSize, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
@@ -11,6 +9,8 @@ use crate::common::hub_helper;
 use crate::files::mkdir;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
+use async_trait::async_trait;
+use clap::ValueEnum;
 use mime::Mime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -111,6 +111,46 @@ async fn config_to_use(hub: &Hub, config: Config) -> Result<Config, CommonError>
     }
 }
 
+pub async fn upload_item(
+    hub: Arc<Hub>,
+    config: Config,
+    delegate_config: UploadDelegateConfig,
+) -> Result<(), CommonError> {
+    if config.file_path.is_none() {
+        return Err(CommonError::Generic("File path is required".to_string()));
+    }
+    let tm = Arc::new(TaskManager::new(config.workers));
+    let item = DiskItem::for_path(&config.file_path.as_ref().unwrap())?;
+    let existing_items = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
+    println!("Existing items: {:?}", existing_items);
+
+    let task = UploadTask::new(
+        UploadContext {
+            hub: hub.clone(),
+            tm: tm.clone(),
+            delegate_config,
+            options: config.options.clone(),
+        },
+        item,
+        config.parents.clone().unwrap_or_default(),
+        existing_items,
+    );
+
+    tm.add_task(task);
+    tm.wait().await;
+
+    Ok(())
+}
+
+fn single_parent(config: &Config) -> Option<String> {
+    if let Some(parents) = &config.parents {
+        if parents.len() == 1 {
+            return parents.first().cloned();
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 pub struct UploadContext {
     hub: Arc<Hub>,
@@ -176,6 +216,8 @@ impl UploadTask {
         }
     }
 
+    // Do some checks before uploading the contents of a directory,
+    // optionally creating it.
     async fn maybe_upload_directory(&self) -> Result<(), CommonError> {
         if !self.context.options.upload_directories {
             return Err(CommonError::Generic(format!(
@@ -183,6 +225,7 @@ impl UploadTask {
                 self.item.path.display()
             )));
         } else if self.existing_items.is_empty() {
+            // Directory does not exist on drive, create it, then continue uploading.
             let name = self.item.require_name()?;
             let drive_folder = mkdir::create_directory(
                 &self.context.hub,
@@ -206,11 +249,13 @@ impl UploadTask {
                 .do_upload_directory(DriveItem::from_drive_file(&drive_folder)?, vec![])
                 .await;
         } else if self.existing_items.len() > 1 {
+            // More than one item with the same exist on drive, abort.
             return Err(CommonError::Generic(format!(
                 "{}: multiple drive entries with exist with that name",
                 self.item.path.display()
             )));
         } else {
+            // Exactly one item with the same exist on drive, continue if it is a directory.
             let existing_item = self.existing_items[0].clone();
             match &self.existing_items[0].details {
                 DriveItemDetails::File { .. } | DriveItemDetails::Shortcut { .. } => {
@@ -232,11 +277,15 @@ impl UploadTask {
         }
     }
 
+    // Do the actual job of uploading the contents of a directory.  At
+    // this point the drive directory exists and we only have to add
+    // tasks to upload each entry in the local directory.
     async fn do_upload_directory(
         &self,
         drive_dir: DriveItem,
         drive_items: Vec<DriveItem>,
     ) -> Result<(), CommonError> {
+        // List all the existing drive items.
         let mut drive_item_map: HashMap<String, Vec<DriveItem>> = HashMap::new();
         for drive_item in &drive_items {
             let name = drive_item.name.clone();
@@ -246,7 +295,8 @@ impl UploadTask {
                 drive_item_map.insert(name, vec![drive_item.clone()]);
             }
         }
-        println!("listing local dir: {:?}", self.item.name);
+
+        // Iterate over all the local items, creating upload tasks.
         let disk_items = self.item.list_dir()?;
         for disk_item in disk_items {
             let disk_name = disk_item.require_name()?;
@@ -259,11 +309,12 @@ impl UploadTask {
             );
             self.context.tm.add_task(task);
         }
-        println!("{:?}: done with directory", drive_dir);
+
         // TODO: implement the Sync deletion part here.
         Ok(())
     }
 
+    // Do some checks before uploading a file.
     async fn maybe_upload_file(&self) -> Result<(), CommonError> {
         if self.existing_items.is_empty() {
             return self.do_upload_file().await;
@@ -285,13 +336,12 @@ impl UploadTask {
         }
     }
 
-    // Handle uploading an item when one or more exist with the same name
-    // on disk.
+    // Handle uploading a file when one or more drive items exist with
+    // the same name on drive.
     async fn handle_existing_items(&self) -> Result<(), CommonError> {
-        // Abort if any is not a file
+        // Abort if any of the existing drive items is not a file.
         for item in &self.existing_items {
             match item.details {
-                DriveItemDetails::File { .. } => {}
                 DriveItemDetails::Directory { .. } => {
                     return Err(CommonError::Generic(format!(
                         "{}: existing drive items is a folder, skipped",
@@ -304,19 +354,20 @@ impl UploadTask {
                         self.item.path.display()
                     )));
                 }
+                _ => {}
             }
         }
-        // Update the first match.
-        // TODO: Find the best match?
-        // In "sync" delete the extra files.
 
+        // MAYBE: Find the best match to update? Presently we update the
+        // first match.
+
+        // TODO: In "sync" mode delete the extra files.
         return self.do_update_file(&self.existing_items[0]).await;
     }
 
+    // Upload the file contents to a new drive file.
     async fn do_upload_file(&self) -> Result<(), CommonError> {
-        // For a file, name has to be specified. (Empty name is root /)
         let name = self.item.require_name()?;
-        println!("do_upload_file in {:?}, {:?}", self.parent_id, name); 
 
         let file = std::fs::File::open(&self.item.path).map_err(|err| {
             CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
@@ -346,15 +397,14 @@ impl UploadTask {
 
         let reader = std::io::BufReader::new(file);
 
-        let _drive_file = upload_file(
+        let _file = DriveItem::upload(
             &self.context.hub,
             reader,
             None,
             file_info,
             self.context.delegate_config.clone(),
         )
-        .await
-        .map_err(|err| CommonError::Generic(format!("{}: {}", self.item.path.display(), err)))?;
+        .await?;
 
         Ok(())
     }
@@ -384,17 +434,18 @@ impl UploadTask {
 
                 let reader = std::io::BufReader::new(file);
 
-                let _drive_file = update_file(
-                    &self.context.hub,
-                    reader,
-                    &drive_item.id,
-                    file_info,
-                    self.context.delegate_config.clone(),
-                )
-                .await
-                .map_err(|err| {
-                    CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
-                })?;
+                let _drive_file = &drive_item
+                    .update(
+                        &self.context.hub,
+                        reader,
+                        &drive_item.id,
+                        file_info,
+                        self.context.delegate_config.clone(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
+                    })?;
 
                 Ok(())
             }
@@ -424,117 +475,4 @@ impl DriveTask for UploadTask {
             }
         }
     }
-}
-
-fn single_parent(config: &Config) -> Option<String> {
-    if let Some(parents) = &config.parents {
-        if parents.len() == 1 {
-            return parents.first().cloned();
-        }
-    }
-    None
-}
-
-pub async fn upload_item(
-    hub: Arc<Hub>,
-    config: Config,
-    delegate_config: UploadDelegateConfig,
-) -> Result<(), CommonError> {
-    if config.file_path.is_none() {
-        return Err(CommonError::Generic("File path is required".to_string()));
-    }
-    let tm = Arc::new(TaskManager::new(config.workers));
-    let item = DiskItem::for_path(&config.file_path.as_ref().unwrap())?;
-    let existing_items = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
-    println!("Existing items: {:?}", existing_items);
-
-    let task = UploadTask::new(
-        UploadContext {
-            hub: hub.clone(),
-            tm: tm.clone(),
-            delegate_config,
-            options: config.options.clone(),
-        },
-        item,
-        config.parents.clone().unwrap_or_default(),
-        existing_items,
-    );
-
-    tm.add_task(task);
-    tm.wait().await;
-
-    Ok(())
-}
-
-pub async fn upload_file<RS>(
-    hub: &Hub,
-    src_file: RS,
-    file_id: Option<String>,
-    file_info: FileInfo,
-    delegate_config: UploadDelegateConfig,
-) -> Result<google_drive3::api::File, google_drive3::Error>
-where
-    RS: google_drive3::client::ReadSeek,
-{
-    println!("Upload file: {:?}: {:?}", file_id, file_info.name);
-    let dst_file = google_drive3::api::File {
-        id: file_id,
-        name: Some(file_info.name),
-        mime_type: Some(file_info.mime_type.to_string()),
-        parents: file_info.parents,
-        ..google_drive3::api::File::default()
-    };
-
-    let chunk_size_bytes = delegate_config.chunk_size.in_bytes();
-    let mut delegate = UploadDelegate::new(delegate_config);
-
-    let req = hub
-        .files()
-        .create(dst_file)
-        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true);
-
-    let (_, file) = if file_info.size > chunk_size_bytes {
-        req.upload_resumable(src_file, file_info.mime_type).await?
-    } else {
-        req.upload(src_file, file_info.mime_type).await?
-    };
-
-    Ok(file)
-}
-
-pub async fn update_file<RS>(
-    hub: &Hub,
-    src_file: RS,
-    file_id: &String,
-    file_info: FileInfo,
-    delegate_config: UploadDelegateConfig,
-) -> Result<google_drive3::api::File, google_drive3::Error>
-where
-    RS: google_drive3::client::ReadSeek,
-{
-    let dst_file = google_drive3::api::File {
-        name: Some(file_info.name),
-        ..google_drive3::api::File::default()
-    };
-
-    let mut delegate = UploadDelegate::new(delegate_config);
-
-    let req = hub
-        .files()
-        .update(dst_file, &file_id)
-        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true);
-
-    let (_, file) = if file_info.size > 0 {
-        req.upload_resumable(src_file, file_info.mime_type).await?
-    } else {
-        req.upload(src_file, file_info.mime_type).await?
-    };
-
-    Ok(file)
 }
