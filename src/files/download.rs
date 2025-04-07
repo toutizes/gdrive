@@ -1,3 +1,4 @@
+use crate::common::disk_item::DiskItem;
 use crate::common::drive_file_helper;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
@@ -10,9 +11,6 @@ use async_trait::async_trait;
 use human_bytes::human_bytes;
 use std::collections::HashSet;
 use std::fs;
-use std::fs::File;
-use std::io;
-use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -209,7 +207,8 @@ impl DownloadTask {
 
         let num_dirs_created = create_dir_if_needed(filepath)?;
 
-        let items = DriveItem::list_drive_dir(&self.context.hub, &Some(self.item.id.clone())).await?;
+        let items =
+            DriveItem::list_drive_dir(&self.context.hub, &Some(self.item.id.clone())).await?;
 
         // Use to collect the existing drive files if we want to delete
         // the extra local files later.
@@ -217,15 +216,13 @@ impl DownloadTask {
 
         for item in items {
             keep_names.insert(item.name.clone());
-            
+
             let itempath = Some(filepath.join(&item.name));
-            
-            self.context.tm.add_task(DownloadTask::new(
-                self.context.clone(),
-                item,
-                itempath,
-            ));
-         }
+
+            self.context
+                .tm
+                .add_task(DownloadTask::new(self.context.clone(), item, itempath));
+        }
 
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
         let mut num_files_deleted: usize = 0;
@@ -259,7 +256,7 @@ impl DownloadTask {
                     if options.existing_file_action == ExistingFileAction::Abort {
                         return Err(CommonError::FileExists(filepath.clone()));
                     }
-                    if local_file_is_identical(filepath, md5) {
+                    if DiskItem::for_path(filepath).matches_md5(md5) {
                         return Ok(());
                     }
                 }
@@ -373,43 +370,4 @@ fn delete_extra_local_files(
         }
     }
     Ok(n)
-}
-
-fn local_file_is_identical(path: &PathBuf, drive_md5: &String) -> bool {
-    if path.exists() {
-        let file_md5 = compute_md5_from_path(path).unwrap_or_else(|err| {
-            eprintln!(
-                "Warning: CommonError while computing md5 of '{}': {}",
-                path.display(),
-                err
-            );
-
-            String::new()
-        });
-
-        file_md5 == *drive_md5
-    } else {
-        false
-    }
-}
-
-fn compute_md5_from_path(path: &PathBuf) -> Result<String, io::Error> {
-    let input = File::open(path)?;
-    let reader = BufReader::new(input);
-    compute_md5_from_reader(reader)
-}
-
-fn compute_md5_from_reader<R: Read>(mut reader: R) -> Result<String, io::Error> {
-    let mut context = md5::Context::new();
-    let mut buffer = [0; 4096];
-
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        context.consume(&buffer[..count]);
-    }
-
-    Ok(format!("{:x}", context.compute()))
 }

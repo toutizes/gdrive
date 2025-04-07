@@ -206,6 +206,17 @@ impl DriveItem {
 
         Ok(file)
     }
+
+    pub async fn delete(&self, hub: &Hub) -> Result<(), CommonError> {
+        hub.files()
+            .delete(&self.id)
+            .supports_all_drives(true)
+            .add_scope(google_drive3::api::Scope::Full)
+            .doit()
+            .await
+            .map_err(|err| CommonError::Generic(err.to_string()))?;
+        Ok(())
+    }
 }
 
 macro_rules! get_file_property {

@@ -12,13 +12,13 @@ use crate::hub::Hub;
 use async_trait::async_trait;
 use clap::ValueEnum;
 use mime::Mime;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, PartialEq)]
 pub enum ExistingDriveFileAction {
     Skip,
     Replace,
@@ -120,9 +120,8 @@ pub async fn upload_item(
         return Err(CommonError::Generic("File path is required".to_string()));
     }
     let tm = Arc::new(TaskManager::new(config.workers));
-    let item = DiskItem::for_path(&config.file_path.as_ref().unwrap())?;
+    let item = DiskItem::for_path(&config.file_path.as_ref().unwrap());
     let existing_items = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
-    println!("Existing items: {:?}", existing_items);
 
     let task = UploadTask::new(
         UploadContext {
@@ -203,10 +202,8 @@ impl UploadTask {
 
     async fn upload(&self) -> Result<(), CommonError> {
         if self.item.path.is_dir() {
-            println!("Is dir: {:?}", self.item.name);
             self.maybe_upload_directory().await
         } else if self.item.path.is_file() {
-            println!("Is file: {:?}", self.item.name);
             self.maybe_upload_file().await
         } else {
             Err(CommonError::Generic(format!(
@@ -265,7 +262,6 @@ impl UploadTask {
                     )));
                 }
                 DriveItemDetails::Directory { .. } => {
-                    println!("Listing drive dir: {:?}", existing_item);
                     let drive_items = DriveItem::list_drive_dir(
                         &self.context.hub,
                         &Some(existing_item.id.clone()),
@@ -297,9 +293,11 @@ impl UploadTask {
         }
 
         // Iterate over all the local items, creating upload tasks.
+        let mut disk_item_set: HashSet<String> = HashSet::new();
         let disk_items = self.item.list_dir()?;
         for disk_item in disk_items {
             let disk_name = disk_item.require_name()?;
+            disk_item_set.insert(disk_name.clone());
             let drive_items = drive_item_map.get(disk_name).cloned().unwrap_or_default();
             let task = UploadTask::new(
                 self.context.clone(),
@@ -310,7 +308,18 @@ impl UploadTask {
             self.context.tm.add_task(task);
         }
 
-        // TODO: implement the Sync deletion part here.
+        // In sync mode, delete drive files that do not exist on the local disk.
+        for drive_item in &drive_items {
+            if !disk_item_set.contains(&drive_item.name) {
+                println!(
+                    "{}: deleting existing file ({})",
+                    self.item.path.display(),
+                    drive_item.id
+                );
+                drive_item.delete(&self.context.hub).await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -358,11 +367,42 @@ impl UploadTask {
             }
         }
 
-        // MAYBE: Find the best match to update? Presently we update the
-        // first match.
+        // Update the first existing item and delete the others.
+        // MAYBE: Find a "best match" to update?
+        if self.context.options.existing_file_action == ExistingDriveFileAction::Sync {
+            for i in 0..self.existing_items.len() {
+                let drive_item = &self.existing_items[i];
+                if i == 0 {
+                    // Update the first item
+                    if let DriveItemDetails::File { md5, .. } = &drive_item.details {
+                        if self.item.matches_md5(&md5) {
+                            println!(
+                                "{}: file already exists and is identical ({})",
+                                self.item.path.display(),
+                                drive_item.id
+                            );
+                            return Ok(());
+                        }
+                    }
+                    println!(
+                        "{}: updating existing file (id {})",
+                        self.item.path.display(),
+                        drive_item.id
+                    );
+                    self.do_update_file(&self.existing_items[0]).await?;
+                } else {
+                    // Delete the rest
+                    println!(
+                        "{}: deleting existing file (id {})",
+                        self.item.path.display(),
+                        drive_item.id
+                    );
+                    self.existing_items[i].delete(&self.context.hub).await?;
+                }
+            }
+        }
 
-        // TODO: In "sync" mode delete the extra files.
-        return self.do_update_file(&self.existing_items[0]).await;
+        Ok(())
     }
 
     // Upload the file contents to a new drive file.
