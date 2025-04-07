@@ -20,7 +20,7 @@ impl DiskItem {
     }
 
     pub fn list_dir(&self) -> Result<Vec<DiskItem>, CommonError> {
-        if self.path.is_dir() {
+        if !self.path.is_dir() {
             return Err(CommonError::Generic(format!(
                 "{}: not a directory",
                 self.path.display(),

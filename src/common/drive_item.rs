@@ -4,6 +4,7 @@ use crate::common::error::CommonError;
 use crate::files::list;
 use crate::hub::Hub;
 
+#[derive(Debug, Clone)]
 pub enum DriveItemDetails {
     Directory {},
     File {
@@ -17,6 +18,7 @@ pub enum DriveItemDetails {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct DriveItem {
     pub id: String,
     pub name: String,

@@ -10,22 +10,23 @@ use crate::common::file_helper;
 use crate::common::file_info;
 use crate::common::file_info::FileInfo;
 use crate::common::file_tree;
-use crate::common::file_tree::FileTree;
+// use crate::common::file_tree::FileTree;
 use crate::common::hub_helper;
-use crate::common::id_gen::IdGen;
+// use crate::common::id_gen::IdGen;
 // use crate::files;
 // use crate::files::info::DisplayConfig;
 use crate::files::mkdir;
-use crate::files::tasks::{DriveTask, DriveTaskStatus};
+use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
 use async_trait::async_trait;
 use clap::ValueEnum;
-use human_bytes::human_bytes;
+// use human_bytes::human_bytes;
 use mime::Mime;
+use std::collections::HashMap;
 use std::error;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::fs;
+// use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -55,6 +56,8 @@ pub struct Config {
     pub print_chunk_errors: bool,
     pub print_chunk_info: bool,
     pub print_only_id: bool,
+    pub workers: usize,
+    pub pretend: bool,
     pub options: UploadOptions,
 }
 
@@ -78,38 +81,25 @@ pub async fn upload(cl_config: Config) -> Result<(), CommonError> {
         print_chunk_info: config.print_chunk_info,
     };
 
-    match &config.file_path {
-        Some(path) => {
-            err_if_directory(&path, &config)?;
-
-            if path.is_dir() {
-                upload_directory(&hub, &config, delegate_config)
-                    .await
-                    .map_err(|err| CommonError::Generic(err.to_string()))?;
-            } else {
-                upload_regular(hub.clone(), &config, delegate_config)
-                    .await
-                    .map_err(|err| CommonError::Generic(err.to_string()))?;
-            }
+    match config.file_path {
+        Some(_) => {
+            return upload_item(hub.clone(), config, delegate_config).await;
         }
         None => {
             let tmp_file = file_helper::stdin_to_file()
                 .map_err(|err| CommonError::Generic(err.to_string()))?;
 
-            upload_regular(
+            return upload_item(
                 hub.clone(),
-                &Config {
+                Config {
                     file_path: Some(tmp_file.as_ref().to_path_buf()),
                     ..config
                 },
                 delegate_config,
             )
-            .await
-            .map_err(|err| CommonError::Generic(err.to_string()))?;
+            .await;
         }
     };
-
-    Ok(())
 }
 
 async fn config_to_use(hub: &Hub, config: Config) -> Result<Config, CommonError> {
@@ -139,7 +129,7 @@ async fn config_to_use(hub: &Hub, config: Config) -> Result<Config, CommonError>
 #[derive(Clone)]
 pub struct UploadContext {
     hub: Arc<Hub>,
-    // tm: Arc<TaskManager<UploadTask>>,
+    tm: Arc<TaskManager<UploadTask>>,
     delegate_config: UploadDelegateConfig,
     options: UploadOptions,
 }
@@ -188,8 +178,10 @@ impl UploadTask {
 
     async fn upload(&self) -> Result<(), CommonError> {
         if self.item.path.is_dir() {
-            self.do_upload_directory().await
+            println!("Is dir: {:?}", self.item.name);
+            self.maybe_upload_directory().await
         } else if self.item.path.is_file() {
+            println!("Is file: {:?}", self.item.name);
             self.maybe_upload_file().await
         } else {
             Err(CommonError::Generic(format!(
@@ -199,7 +191,91 @@ impl UploadTask {
         }
     }
 
-    async fn do_upload_directory(&self) -> Result<(), CommonError> {
+    async fn maybe_upload_directory(&self) -> Result<(), CommonError> {
+        if !self.context.options.upload_directories {
+            return Err(CommonError::Generic(format!(
+                "{}: is a directory. Use --recursive to upload",
+                self.item.path.display()
+            )));
+        } else if self.existing_items.is_empty() {
+            let name = self.item.require_name()?;
+            let drive_folder = mkdir::create_directory(
+                &self.context.hub,
+                &mkdir::Config {
+                    id: None,
+                    name: name.clone(),
+                    parents: Some(self.parent_id.clone()),
+                    print_only_id: false,
+                },
+                self.context.delegate_config.clone(),
+            )
+            .await
+            .map_err(|err| {
+                CommonError::Generic(format!(
+                    "{}: cannot create {}",
+                    self.item.path.display(),
+                    err
+                ))
+            })?;
+            return self
+                .do_upload_directory(DriveItem::from_drive_file(&drive_folder)?, vec![])
+                .await;
+        } else if self.existing_items.len() > 1 {
+            return Err(CommonError::Generic(format!(
+                "{}: multiple drive entries with exist with that name",
+                self.item.path.display()
+            )));
+        } else {
+            let existing_item = self.existing_items[0].clone();
+            match &self.existing_items[0].details {
+                DriveItemDetails::File { .. } | DriveItemDetails::Shortcut { .. } => {
+                    return Err(CommonError::Generic(format!(
+                        "{}: exists in Google Drive but is not a directory, skipping",
+                        self.item.path.display()
+                    )));
+                }
+                DriveItemDetails::Directory { .. } => {
+                    println!("Listing drive dir: {:?}", existing_item);
+                    let drive_items = DriveItem::list_drive_dir(
+                        &self.context.hub,
+                        &Some(existing_item.id.clone()),
+                    )
+                    .await?;
+                    return self.do_upload_directory(existing_item, drive_items).await;
+                }
+            }
+        }
+    }
+
+    async fn do_upload_directory(
+        &self,
+        drive_dir: DriveItem,
+        drive_items: Vec<DriveItem>,
+    ) -> Result<(), CommonError> {
+        let mut drive_item_map: HashMap<String, Vec<DriveItem>> = HashMap::new();
+        for drive_item in &drive_items {
+            let name = drive_item.name.clone();
+            if let Some(in_map_items) = drive_item_map.get_mut(&name) {
+                in_map_items.push(drive_item.clone());
+            } else {
+                drive_item_map.insert(name, vec![drive_item.clone()]);
+            }
+        }
+        println!("listing local dir: {:?}", self.item.name);
+        let disk_items = self.item.list_dir()?;
+        for disk_item in disk_items {
+            let disk_name = disk_item.require_name()?;
+            let drive_items = drive_item_map.get(disk_name).cloned().unwrap_or_default();
+            let task = UploadTask::new(
+                self.context.clone(),
+                disk_item,
+                vec![drive_dir.id.clone()],
+                drive_items,
+            );
+            self.context.tm.add_task(task);
+        }
+        println!("{:?}: done with directory", drive_dir);
+        // TODO: implement the Sync deletion part here.
         Ok(())
     }
 
@@ -255,6 +331,7 @@ impl UploadTask {
     async fn do_upload_file(&self) -> Result<(), CommonError> {
         // For a file, name has to be specified. (Empty name is root /)
         let name = self.item.require_name()?;
+        println!("do_upload_file in {:?}, {:?}", self.parent_id, name); 
 
         let file = std::fs::File::open(&self.item.path).map_err(|err| {
             CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
@@ -387,7 +464,7 @@ pub async fn upload_regular(
     let task = UploadTask::new(
         UploadContext {
             hub: hub.clone(),
-            // tm: Arc::new(TaskManager::new()),
+            tm: Arc::new(TaskManager::new(config.workers)),
             delegate_config,
             options: config.options.clone(),
         },
@@ -401,100 +478,33 @@ pub async fn upload_regular(
     Ok(())
 }
 
-pub async fn upload_directory(
-    hub: &Hub,
-    config: &Config,
+pub async fn upload_item(
+    hub: Arc<Hub>,
+    config: Config,
     delegate_config: UploadDelegateConfig,
-) -> Result<(), Error> {
-    let mut ids = IdGen::new(hub, &delegate_config);
-    let tree = FileTree::from_path(config.file_path.as_ref().unwrap(), &mut ids)
-        .await
-        .map_err(Error::CreateFileTree)?;
-
-    let tree_info = tree.info();
-
-    if !config.print_only_id {
-        println!(
-            "Found {} files in {} directories with a total size of {}",
-            tree_info.file_count,
-            tree_info.folder_count,
-            human_bytes(tree_info.total_file_size as f64)
-        );
+) -> Result<(), CommonError> {
+    if config.file_path.is_none() {
+        return Err(CommonError::Generic("File path is required".to_string()));
     }
+    let tm = Arc::new(TaskManager::new(config.workers));
+    let item = DiskItem::for_path(&config.file_path.as_ref().unwrap())?;
+    let existing_items = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
+    println!("Existing items: {:?}", existing_items);
 
-    for folder in &tree.folders() {
-        let folder_parents = folder
-            .parent
-            .as_ref()
-            .map(|p| vec![p.drive_id.clone()])
-            .or_else(|| config.parents.clone());
+    let task = UploadTask::new(
+        UploadContext {
+            hub: hub.clone(),
+            tm: tm.clone(),
+            delegate_config,
+            options: config.options.clone(),
+        },
+        item,
+        config.parents.clone().unwrap_or_default(),
+        existing_items,
+    );
 
-        if !config.print_only_id {
-            println!(
-                "Creating directory '{}' with id: {}",
-                folder.relative_path().display(),
-                folder.drive_id
-            );
-        }
-
-        let drive_folder = mkdir::create_directory(
-            hub,
-            &mkdir::Config {
-                id: Some(folder.drive_id.clone()),
-                name: folder.name.clone(),
-                parents: folder_parents,
-                print_only_id: false,
-            },
-            delegate_config.clone(),
-        )
-        .await
-        .map_err(Error::Mkdir)?;
-
-        if config.print_only_id {
-            println!("{}: {}", folder.relative_path().display(), folder.drive_id);
-        }
-
-        let folder_id = drive_folder.id.ok_or(Error::DriveFolderMissingId)?;
-        let parents = Some(vec![folder_id.clone()]);
-
-        for file in folder.files() {
-            let os_file = fs::File::open(&file.path)
-                .map_err(|err| Error::OpenFile(config.file_path.as_ref().unwrap().clone(), err))?;
-
-            let file_info = file.info(parents.clone());
-
-            if !config.print_only_id {
-                println!(
-                    "Uploading file '{}' with id: {}",
-                    file.relative_path().display(),
-                    file.drive_id
-                );
-            }
-
-            upload_file(
-                hub,
-                os_file,
-                Some(file.drive_id.clone()),
-                file_info,
-                delegate_config.clone(),
-            )
-            .await
-            .map_err(Error::Upload)?;
-
-            if config.print_only_id {
-                println!("{}: {}", file.relative_path().display(), file.drive_id);
-            }
-        }
-    }
-
-    if !config.print_only_id {
-        println!(
-            "Uploaded {} files in {} directories with a total size of {}",
-            tree_info.file_count,
-            tree_info.folder_count,
-            human_bytes(tree_info.total_file_size as f64)
-        );
-    }
+    tm.add_task(task);
+    tm.wait().await;
 
     Ok(())
 }
@@ -609,13 +619,13 @@ impl Display for Error {
     }
 }
 
-fn err_if_directory(path: &PathBuf, config: &Config) -> Result<(), CommonError> {
-    if path.is_dir() && !config.options.upload_directories {
-        Err(CommonError::Generic(format!(
-            "{}: is a directory, use --recursive to upload",
-            path.display()
-        )))
-    } else {
-        Ok(())
-    }
-}
+// fn err_if_directory(path: &PathBuf, config: &Config) -> Result<(), CommonError> {
+//     if path.is_dir() && !config.options.upload_directories {
+//         Err(CommonError::Generic(format!(
+//             "{}: is a directory, use --recursive to upload",
+//             path.display()
+//         )))
+//     } else {
+//         Ok(())
+//     }
+// }

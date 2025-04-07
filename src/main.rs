@@ -22,6 +22,14 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Only list what would be done.
+    #[arg(long, default_value="false")]
+    pretend: Option<bool>,
+
+    /// Number of workers to use for parallelising operations
+    #[arg(long, default_value="1")]
+    workers: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -183,10 +191,6 @@ enum FileCommand {
         /// Path where the file/directory should be downloaded to
         #[arg(long, value_name = "PATH")]
         destination: Option<PathBuf>,
-
-        /// Number of workers to use for downloading files in parallel
-        #[arg(long)]
-        workers: Option<usize>,
 
         /// Write file to stdout
         #[arg(long)]
@@ -526,7 +530,6 @@ async fn main() {
                     follow_shortcuts,
                     recursive,
                     destination,
-                    workers,
                     stdout,
                 } => {
                     let existing_file_action = if sync {
@@ -554,7 +557,7 @@ async fn main() {
                             download_directories: recursive,
                         },
                         destination: dst,
-                        workers: workers.unwrap_or(1),
+                        workers: cli.workers.unwrap(),
                     })
                     .await
                     .unwrap_or_else(handle_error)
@@ -581,6 +584,8 @@ async fn main() {
                         print_chunk_errors,
                         print_chunk_info,
                         print_only_id,
+                        workers: cli.workers.unwrap(),
+                        pretend: cli.pretend.unwrap(),
                         options: files::upload::UploadOptions {
                             existing_file_action,
                             upload_directories: recursive,
