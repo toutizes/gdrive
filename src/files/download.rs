@@ -2,11 +2,11 @@ use crate::common::disk_item::DiskItem;
 use crate::common::drive_file_helper;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
-use crate::common::error::CommonError;
 use crate::common::hub_helper;
 use crate::files;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use human_bytes::human_bytes;
 use std::collections::HashSet;
@@ -44,33 +44,30 @@ pub enum ExistingFileAction {
     SyncLocal,
 }
 
-pub async fn download(config: Config) -> Result<(), CommonError> {
+pub async fn download(config: Config) -> Result<()> {
     let start = Instant::now();
-    let hub = Arc::new(hub_helper::get_hub().await.map_err(CommonError::Hub)?);
+    let hub = Arc::new(hub_helper::get_hub().await?);
 
     let file_id: String;
     if let Some(ref id) = config.file_id {
         if config.file_name.is_some() {
-            return Err(CommonError::Generic(
+            return Err(anyhow!(
                 "Only one of file_id or file_name can be specified".to_string(),
             ));
         }
         file_id = id.clone();
     } else if let Some(ref name) = config.file_name {
         file_id = drive_names::resolve(&hub, &name)
-            .await
-            .map_err(|err| CommonError::Generic(err.to_string()))?;
+            .await?;
     } else {
-        return Err(CommonError::Generic(
+        return Err(anyhow!(
             "Either file_id or file_name must be specified".to_string(),
         ));
     }
 
     let file = files::info::get_file(&hub, &file_id)
-        .await
-        .map_err(CommonError::GetFile)?;
-    let item = DriveItem::from_drive_file(&file)
-        .map_err(|err| CommonError::Generic(format!("{}", err)))?;
+        .await?;
+    let item = DriveItem::from_drive_file(&file)?;
 
     let dest: Option<PathBuf>;
     match &config.destination {
@@ -174,7 +171,7 @@ impl DownloadTask {
         }
     }
 
-    pub async fn download(&self) -> Result<(), CommonError> {
+    pub async fn download(&self) -> Result<()> {
         match &self.item.details {
             DriveItemDetails::Directory {} => {
                 self.download_directory().await?;
@@ -189,20 +186,17 @@ impl DownloadTask {
         Ok(())
     }
 
-    async fn download_directory(&self) -> Result<(), CommonError> {
+    async fn download_directory(&self) -> Result<()> {
         if !self.context.options.download_directories {
-            return Err(CommonError::Generic(format!(
+            return Err(anyhow!(
                 "{}: drive file is a directory, use --recursive to download directories",
                 self.item.name,
-            )));
+            ));
         }
 
         let filepath: &PathBuf = self
             .filepath
             .as_ref()
-            .ok_or(CommonError::Generic(
-                "Directories cannot be downloaded to stdout".to_string(),
-            ))
             .unwrap();
 
         let num_dirs_created = create_dir_if_needed(filepath)?;
@@ -228,7 +222,7 @@ impl DownloadTask {
         let mut num_files_deleted: usize = 0;
         if self.context.options.existing_file_action == ExistingFileAction::SyncLocal {
             num_files_deleted = delete_extra_local_files(filepath, &keep_names)
-                .map_err(|err| CommonError::Generic(format!("{}", err)))?;
+?;
         }
 
         *(self.stats.lock().unwrap()) = DownloadStats {
@@ -242,19 +236,19 @@ impl DownloadTask {
         Ok(())
     }
 
-    async fn download_file(&self, md5: &String) -> Result<(), CommonError> {
+    async fn download_file(&self, md5: &String) -> Result<()> {
         match &self.filepath {
             Some(filepath) => {
                 let options = &self.context.options;
                 if filepath.exists() {
                     if filepath.is_dir() {
-                        return Err(CommonError::Generic(format!(
+                        return Err(anyhow!(
                             "{}: this drive file exists as a local directory, not downloaded",
                             filepath.display()
-                        )));
+                        ));
                     }
                     if options.existing_file_action == ExistingFileAction::Abort {
-                        return Err(CommonError::FileExists(filepath.clone()));
+                        return Err(anyhow!("{}: file exists, skipped.", filepath.display()));
                     }
                     if DiskItem::for_path(filepath).matches_md5(md5) {
                         return Ok(());
@@ -295,12 +289,10 @@ impl DownloadTask {
         Ok(())
     }
 
-    async fn download_shortcut(&self, target_id: &String) -> Result<(), CommonError> {
+    async fn download_shortcut(&self, target_id: &String) -> Result<()> {
         let target_file = files::info::get_file(&self.context.hub, target_id)
-            .await
-            .map_err(CommonError::GetFile)?;
-        let target_item = DriveItem::from_drive_file(&target_file)
-            .map_err(|err| CommonError::Generic(format!("{}", err)))?;
+            .await?;
+        let target_item = DriveItem::from_drive_file(&target_file)?;
         self.context.tm.add_task(DownloadTask::new(
             self.context.clone(),
             target_item,
@@ -328,27 +320,23 @@ impl DriveTask for DownloadTask {
     }
 }
 
-fn create_dir_if_needed(path: &PathBuf) -> Result<usize, CommonError> {
+fn create_dir_if_needed(path: &PathBuf) -> Result<usize> {
     // Only create the directory if it doesn't exist
     if !path.exists() {
         println!("{}: created directory", path.display());
-        fs::create_dir_all(&path).map_err(|err| CommonError::CreateDirectory(path.clone(), err))?;
+        fs::create_dir_all(&path)?;
         return Ok(1);
     } else {
-        let file_type = fs::metadata(&path)
-            .map_err(|err| CommonError::CreateDirectory(path.clone(), err))?
+        let file_type = fs::metadata(&path)?
             .file_type();
         if !file_type.is_dir() {
-            return Err(CommonError::IsNotDirectory(path.display().to_string()));
+            return Err(anyhow!("{}: is not a directory, skipped", path.display()));
         }
     }
     Ok(0)
 }
 
-fn delete_extra_local_files(
-    path: &PathBuf,
-    names_to_keep: &HashSet<String>,
-) -> Result<usize, std::io::Error> {
+fn delete_extra_local_files(path: &PathBuf, names_to_keep: &HashSet<String>) -> Result<usize> {
     let mut n: usize = 0;
     for entry in fs::read_dir(path)? {
         let valid_entry = entry?;

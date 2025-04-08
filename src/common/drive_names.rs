@@ -1,7 +1,7 @@
 use crate::common::drive_file;
-use crate::common::error::CommonError;
 use crate::files::list;
 use crate::hub::Hub;
+use anyhow::{anyhow, Result};
 
 struct DriveIdAndIsDirectory {
     id: Option<String>,
@@ -12,7 +12,7 @@ struct DriveIdAndIsDirectory {
 // Returns an error if the file is not found.
 //
 // TODO: Support <drive name>:path/path/file
-pub async fn resolve(hub: &Hub, filepath: &String) -> Result<String, CommonError> {
+pub async fn resolve(hub: &Hub, filepath: &String) -> Result<String> {
     let mut last_found = DriveIdAndIsDirectory {
         id: None,
         is_dir: false,
@@ -29,8 +29,7 @@ pub async fn resolve(hub: &Hub, filepath: &String) -> Result<String, CommonError
                 max_files: usize::MAX,
             },
         )
-        .await
-        .map_err(CommonError::ListFiles)?;
+        .await?;
 
         last_found = find_part(filepath, part, &files)?;
     }
@@ -38,13 +37,10 @@ pub async fn resolve(hub: &Hub, filepath: &String) -> Result<String, CommonError
     if let Some(id) = last_found.id {
         return Ok(id.clone());
     }
-    Err(CommonError::Generic(format!("{}: Empty path", filepath)))
+    Err(anyhow!("{}: Empty path", filepath))
 }
 
-fn make_query(
-    filepath: &String,
-    dnd: &DriveIdAndIsDirectory,
-) -> Result<list::ListQuery, CommonError> {
+fn make_query(filepath: &String, dnd: &DriveIdAndIsDirectory) -> Result<list::ListQuery> {
     if dnd.id.is_none() {
         // List the root of the drive
         return Ok(list::ListQuery::RootNotTrashed);
@@ -56,17 +52,14 @@ fn make_query(
         });
     }
     // We have more parts but the last part is not a folder.
-    Err(CommonError::Generic(format!(
-        "{}: does not exist",
-        filepath
-    )))
+    Err(anyhow!("{}: does not exist", filepath))
 }
 
 fn find_part(
     filepath: &String,
     part: &str,
     files: &Vec<google_drive3::api::File>,
-) -> Result<DriveIdAndIsDirectory, CommonError> {
+) -> Result<DriveIdAndIsDirectory> {
     for file in files {
         if let Some(name) = &file.name {
             if name == part {
@@ -76,16 +69,10 @@ fn find_part(
                         is_dir: drive_file::is_directory(&file),
                     });
                 } else {
-                    return Err(CommonError::Generic(format!(
-                        "{}: {} has no id in drive",
-                        filepath, part
-                    )));
+                    return Err(anyhow!("{}: {} has no id in drive", filepath, part));
                 }
             }
         }
     }
-    Err(CommonError::Generic(format!(
-        "{}: {} does not exist in drive",
-        filepath, part
-    )))
+    Err(anyhow!("{}: {} does not exist in drive", filepath, part))
 }

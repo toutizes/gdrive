@@ -1,6 +1,5 @@
-use crate::common::error::CommonError;
+use anyhow::{anyhow, Result};
 use std::fs::{DirEntry, File};
-use std::io;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
@@ -21,43 +20,44 @@ impl DiskItem {
         }
     }
 
-    pub fn list_dir(&self) -> Result<Vec<DiskItem>, CommonError> {
+    pub fn list_dir(&self) -> Result<Vec<DiskItem>> {
         if !self.path.is_dir() {
-            return Err(CommonError::Generic(format!(
+            return Err(anyhow!(
                 "{}: not a directory",
                 self.path.display(),
-            )));
+            ));
         }
 
         let entries = std::fs::read_dir(&self.path).map_err(|err| {
-            CommonError::Generic(format!("{}: {}", self.path.display(), err.to_string()))
+anyhow!("{} : {}", self.path.display(), err.to_string())
         })?;
 
         let mut disk_entries = Vec::new();
         for entry in entries {
             let valid_entry = entry.map_err(|err| {
-                CommonError::Generic(format!(
+                anyhow!(
                     "In dir {}: {}",
                     self.path.display(),
                     err.to_string(),
-                ))
+                )
             })?;
             disk_entries.push(DiskItem::for_dir_entry(&valid_entry)?);
         }
         Ok(disk_entries)
     }
 
-    fn for_dir_entry(entry: &DirEntry) -> Result<DiskItem, CommonError> {
+    fn for_dir_entry(entry: &DirEntry) -> Result<DiskItem> {
         Ok(DiskItem {
             path: entry.path(),
             name: Some(entry.file_name().to_string_lossy().to_string()),
         })
     }
 
-    pub fn require_name(&self) -> Result<&String, CommonError> {
-        self.name
-            .as_ref()
-            .ok_or_else(|| CommonError::Generic("File name is required".to_string()))
+    pub fn require_name(&self) -> Result<&String> {
+        match &self.name {
+            Some(name) => Ok(name),
+            None => Err(anyhow!("Filename is required")),
+        }
     }
 
     pub fn matches_md5(&self, drive_md5: &String) -> bool {
@@ -75,13 +75,13 @@ impl DiskItem {
     }
 }
 
-fn compute_md5_from_path(path: &PathBuf) -> Result<String, io::Error> {
+fn compute_md5_from_path(path: &PathBuf) -> Result<String> {
     let input = File::open(path)?;
     let reader = BufReader::new(input);
     compute_md5_from_reader(reader)
 }
 
-fn compute_md5_from_reader<R: Read>(mut reader: R) -> Result<String, io::Error> {
+fn compute_md5_from_reader<R: Read>(mut reader: R) -> Result<String> {
     let mut context = md5::Context::new();
     let mut buffer = [0; 4096];
 

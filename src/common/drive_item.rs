@@ -1,10 +1,10 @@
 use crate::common::delegate::{UploadDelegate, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_file;
-use crate::common::error::CommonError;
 use crate::common::file_info::FileInfo;
 use crate::files::list;
 use crate::hub::Hub;
+use anyhow::{anyhow, Result};
 
 #[derive(Debug, Clone)]
 pub enum DriveItemDetails {
@@ -29,7 +29,7 @@ pub struct DriveItem {
 }
 
 impl DriveItem {
-    pub fn from_drive_file(file: &google_drive3::api::File) -> Result<DriveItem, CommonError> {
+    pub fn from_drive_file(file: &google_drive3::api::File) -> Result<DriveItem> {
         let details: DriveItemDetails;
         if drive_file::is_directory(file) {
             details = DriveItemDetails::Directory {};
@@ -42,10 +42,11 @@ impl DriveItem {
         } else if drive_file::is_shortcut(file) {
             details = get_file_shortcut_details(&file)?;
         } else {
-            return Err(CommonError::Generic(format!(
+            return Err(anyhow!(
                 "Unknown file type: mime_type {:?}, md5 {:?}",
-                file.mime_type, file.md5_checksum,
-            )));
+                file.mime_type,
+                file.md5_checksum,
+            ));
         }
 
         return Ok(DriveItem {
@@ -56,10 +57,7 @@ impl DriveItem {
         });
     }
 
-    pub async fn list_drive_dir(
-        hub: &Hub,
-        parent_id: &Option<String>,
-    ) -> Result<Vec<DriveItem>, CommonError> {
+    pub async fn list_drive_dir(hub: &Hub, parent_id: &Option<String>) -> Result<Vec<DriveItem>> {
         let query: list::ListQuery;
         if let Some(ref id) = parent_id {
             query = list::ListQuery::FilesInFolder {
@@ -76,8 +74,7 @@ impl DriveItem {
                 max_files: usize::MAX,
             },
         )
-        .await
-        .map_err(|err| CommonError::Generic(format!("{}", err)))?;
+        .await?;
 
         let mut drive_items = Vec::new();
 
@@ -100,7 +97,7 @@ impl DriveItem {
         hub: &Hub,
         disk_item: &DiskItem,
         parent_id: &Option<String>,
-    ) -> Result<Vec<DriveItem>, CommonError> {
+    ) -> Result<Vec<DriveItem>> {
         let name = disk_item.require_name()?;
         let mut named_items = Vec::new();
         let items = DriveItem::list_drive_dir(hub, parent_id).await?;
@@ -112,16 +109,13 @@ impl DriveItem {
         Ok(named_items)
     }
 
-    pub fn file_mime_type(&self) -> Result<&String, CommonError> {
+    pub fn file_mime_type(&self) -> Result<&String> {
         match &self.details {
             DriveItemDetails::File { mime_type, .. } => Ok(mime_type),
             DriveItemDetails::Shortcut {
                 target_mime_type, ..
             } => Ok(target_mime_type),
-            _ => Err(CommonError::Generic(format!(
-                "{}: is a directory on Google Drive",
-                self.name
-            ))),
+            _ => Err(anyhow!("{}: is a directory on Google Drive", self.name)),
         }
     }
 
@@ -131,7 +125,7 @@ impl DriveItem {
         file_id: Option<String>,
         file_info: FileInfo,
         delegate_config: UploadDelegateConfig,
-    ) -> Result<google_drive3::api::File, CommonError>
+    ) -> Result<google_drive3::api::File>
     where
         RS: google_drive3::client::ReadSeek,
     {
@@ -157,12 +151,10 @@ impl DriveItem {
 
         let (_, file) = if file_info.size > chunk_size_bytes {
             req.upload_resumable(src_file, file_info.mime_type)
-                .await
-                .map_err(|err| CommonError::Generic(err.to_string()))?
+                .await?
         } else {
             req.upload(src_file, file_info.mime_type)
-                .await
-                .map_err(|err| CommonError::Generic(err.to_string()))?
+                .await?
         };
 
         Ok(file)
@@ -175,7 +167,7 @@ impl DriveItem {
         file_id: &String,
         file_info: FileInfo,
         delegate_config: UploadDelegateConfig,
-    ) -> Result<google_drive3::api::File, CommonError>
+    ) -> Result<google_drive3::api::File>
     where
         RS: google_drive3::client::ReadSeek,
     {
@@ -196,36 +188,33 @@ impl DriveItem {
 
         let (_, file) = if file_info.size > 0 {
             req.upload_resumable(src_file, file_info.mime_type)
-                .await
-                .map_err(|err| CommonError::Generic(err.to_string()))?
+                .await?
         } else {
             req.upload(src_file, file_info.mime_type)
-                .await
-                .map_err(|err| CommonError::Generic(err.to_string()))?
+                .await?
         };
 
         Ok(file)
     }
 
-    pub async fn delete(&self, hub: &Hub) -> Result<(), CommonError> {
+    pub async fn delete(&self, hub: &Hub) -> Result<()> {
         hub.files()
             .delete(&self.id)
             .supports_all_drives(true)
             .add_scope(google_drive3::api::Scope::Full)
             .doit()
-            .await
-            .map_err(|err| CommonError::Generic(err.to_string()))?;
+            .await?;
         Ok(())
     }
 }
 
 macro_rules! get_file_property {
     ($func_name:ident, $property:ident, $return_type:ty, $error_message:literal) => {
-        fn $func_name(file: &google_drive3::api::File) -> Result<$return_type, CommonError> {
+        fn $func_name(file: &google_drive3::api::File) -> Result<$return_type> {
             if let Some(ref value) = file.$property {
                 return Ok(value.clone());
             } else {
-                return Err(CommonError::Generic(format!($error_message, file)));
+                return Err(anyhow!($error_message, file));
             }
         }
     };
@@ -242,17 +231,14 @@ get_file_property!(
 );
 get_file_property!(get_file_size, size, i64, "Missing file size: {:?}");
 
-fn get_file_parent(file: &google_drive3::api::File) -> Result<Option<String>, CommonError> {
+fn get_file_parent(file: &google_drive3::api::File) -> Result<Option<String>> {
     if let Some(ref parents) = file.parents {
         if parents.is_empty() {
             return Ok(None);
         } else if parents.len() == 1 {
             return Ok(Some(parents[0].clone()));
         } else {
-            return Err(CommonError::Generic(format!(
-                "More than one parent: {:?}",
-                file
-            )));
+            return Err(anyhow!("More than one parent: {:?}", file));
         }
     } else {
         return Ok(None);
@@ -261,13 +247,11 @@ fn get_file_parent(file: &google_drive3::api::File) -> Result<Option<String>, Co
 
 macro_rules! get_shortcut_property {
     ($func_name:ident, $property:ident, $return_type:ty, $error_message:literal) => {
-        fn $func_name(
-            shortcut: &google_drive3::api::FileShortcutDetails,
-        ) -> Result<$return_type, CommonError> {
+        fn $func_name(shortcut: &google_drive3::api::FileShortcutDetails) -> Result<$return_type> {
             if let Some(ref value) = shortcut.$property {
                 return Ok(value.clone());
             } else {
-                return Err(CommonError::Generic(format!($error_message, shortcut)));
+                return Err(anyhow!($error_message, shortcut));
             }
         }
     };
@@ -286,18 +270,13 @@ get_shortcut_property!(
     "Missing target id: {:?}"
 );
 
-fn get_file_shortcut_details(
-    file: &google_drive3::api::File,
-) -> Result<DriveItemDetails, CommonError> {
+fn get_file_shortcut_details(file: &google_drive3::api::File) -> Result<DriveItemDetails> {
     if let Some(ref details) = file.shortcut_details {
         return Ok(DriveItemDetails::Shortcut {
             target_id: get_shortcut_target_id(&details)?,
             target_mime_type: get_shortcut_target_mime_type(&details)?,
         });
     } else {
-        return Err(CommonError::Generic(format!(
-            "Missing file shortcut details: {:?}",
-            file
-        )));
+        return Err(anyhow!("Missing file shortcut details: {:?}", file));
     }
 }

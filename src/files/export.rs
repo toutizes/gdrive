@@ -2,9 +2,10 @@ use crate::common::drive_file;
 use crate::common::drive_file_helper;
 use crate::common::drive_file::DocType;
 use crate::common::drive_file::FileExtension;
-use crate::common::error::CommonError;
+
 use crate::common::hub_helper;
 use crate::files;
+use anyhow;
 use std::error;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -60,12 +61,12 @@ pub enum Error {
     Hub(hub_helper::Error),
     FileExists(PathBuf),
     GetFile(google_drive3::Error),
-    ExportFile(CommonError),
+    ExportFile(anyhow::Error),
     MissingDriveMime,
     UnsupportedDriveMime(String),
     GetFileExtensionMime(drive_file::FileExtension),
     UnsupportedExportExtension(DocType),
-    SaveFile(CommonError),
+    SaveFile(anyhow::Error),
 }
 
 impl error::Error for Error {}

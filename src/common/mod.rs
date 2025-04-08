@@ -6,7 +6,6 @@ pub mod drive_file_helper;
 pub mod drive_item;
 pub mod drive_names;
 pub mod empty_file;
-pub mod error;
 pub mod file_info;
 pub mod hub_helper;
 pub mod id_gen;

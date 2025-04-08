@@ -2,13 +2,13 @@ use crate::common::delegate::{BackoffConfig, ChunkSize, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
-use crate::common::error::CommonError;
 use crate::common::file_helper;
 use crate::common::file_info::FileInfo;
 use crate::common::hub_helper;
 use crate::files::mkdir;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use clap::ValueEnum;
 use mime::Mime;
@@ -46,12 +46,8 @@ pub struct Config {
     pub options: UploadOptions,
 }
 
-pub async fn upload(cl_config: Config) -> Result<(), CommonError> {
-    let hub = Arc::new(
-        hub_helper::get_hub()
-            .await
-            .map_err(|err| CommonError::Hub(err))?,
-    );
+pub async fn upload(cl_config: Config) -> Result<()> {
+    let hub = Arc::new(hub_helper::get_hub().await?);
 
     let config = config_to_use(&hub, cl_config).await?;
 
@@ -71,8 +67,7 @@ pub async fn upload(cl_config: Config) -> Result<(), CommonError> {
             return upload_item(hub.clone(), config, delegate_config).await;
         }
         None => {
-            let tmp_file = file_helper::stdin_to_file()
-                .map_err(|err| CommonError::Generic(err.to_string()))?;
+            let tmp_file = file_helper::stdin_to_file()?;
 
             return upload_item(
                 hub.clone(),
@@ -87,11 +82,11 @@ pub async fn upload(cl_config: Config) -> Result<(), CommonError> {
     };
 }
 
-async fn config_to_use(hub: &Hub, config: Config) -> Result<Config, CommonError> {
+async fn config_to_use(hub: &Hub, config: Config) -> Result<Config> {
     if let Some(ref paths) = config.parent_paths {
         if config.parents.is_some() {
-            return Err(CommonError::Generic(
-                "Only one of --parent or --parent-path can be specified".to_string(),
+            return Err(anyhow!(
+                "Only one of --parent or --parent-path can be specified"
             ));
         }
         let mut parents = Vec::new();
@@ -103,9 +98,7 @@ async fn config_to_use(hub: &Hub, config: Config) -> Result<Config, CommonError>
             ..config
         })
     } else if config.parents.is_none() {
-        Err(CommonError::Generic(
-            "Must pass one of --parent or --parent-path".to_string(),
-        ))
+        Err(anyhow!("Must pass one of --parent or --parent-path"))
     } else {
         Ok(config)
     }
@@ -115,9 +108,9 @@ pub async fn upload_item(
     hub: Arc<Hub>,
     config: Config,
     delegate_config: UploadDelegateConfig,
-) -> Result<(), CommonError> {
+) -> Result<()> {
     if config.file_path.is_none() {
-        return Err(CommonError::Generic("File path is required".to_string()));
+        return Err(anyhow!("File path is required".to_string()));
     }
     let tm = Arc::new(TaskManager::new(config.workers));
     let item = DiskItem::for_path(&config.file_path.as_ref().unwrap());
@@ -200,27 +193,27 @@ impl UploadTask {
         }
     }
 
-    async fn upload(&self) -> Result<(), CommonError> {
+    async fn upload(&self) -> Result<()> {
         if self.item.path.is_dir() {
             self.maybe_upload_directory().await
         } else if self.item.path.is_file() {
             self.maybe_upload_file().await
         } else {
-            Err(CommonError::Generic(format!(
+            Err(anyhow!(
                 "{}: not a file or directory, skipped",
                 self.item.path.display()
-            )))
+            ))
         }
     }
 
     // Do some checks before uploading the contents of a directory,
     // optionally creating it.
-    async fn maybe_upload_directory(&self) -> Result<(), CommonError> {
+    async fn maybe_upload_directory(&self) -> Result<()> {
         if !self.context.options.upload_directories {
-            return Err(CommonError::Generic(format!(
+            return Err(anyhow!(
                 "{}: is a directory. Use --recursive to upload",
                 self.item.path.display()
-            )));
+            ));
         } else if self.existing_items.is_empty() {
             // Directory does not exist on drive, create it, then continue uploading.
             let name = self.item.require_name()?;
@@ -234,32 +227,25 @@ impl UploadTask {
                 },
                 self.context.delegate_config.clone(),
             )
-            .await
-            .map_err(|err| {
-                CommonError::Generic(format!(
-                    "{}: cannot create {}",
-                    self.item.path.display(),
-                    err
-                ))
-            })?;
+            .await?;
             return self
                 .do_upload_directory(DriveItem::from_drive_file(&drive_folder)?, vec![])
                 .await;
         } else if self.existing_items.len() > 1 {
             // More than one item with the same exist on drive, abort.
-            return Err(CommonError::Generic(format!(
+            return Err(anyhow!(
                 "{}: multiple drive entries with exist with that name",
                 self.item.path.display()
-            )));
+            ));
         } else {
             // Exactly one item with the same exist on drive, continue if it is a directory.
             let existing_item = self.existing_items[0].clone();
             match &self.existing_items[0].details {
                 DriveItemDetails::File { .. } | DriveItemDetails::Shortcut { .. } => {
-                    return Err(CommonError::Generic(format!(
+                    return Err(anyhow!(
                         "{}: exists in Google Drive but is not a directory, skipping",
                         self.item.path.display()
-                    )));
+                    ));
                 }
                 DriveItemDetails::Directory { .. } => {
                     let drive_items = DriveItem::list_drive_dir(
@@ -280,7 +266,7 @@ impl UploadTask {
         &self,
         drive_dir: DriveItem,
         drive_items: Vec<DriveItem>,
-    ) -> Result<(), CommonError> {
+    ) -> Result<()> {
         // List all the existing drive items.
         let mut drive_item_map: HashMap<String, Vec<DriveItem>> = HashMap::new();
         for drive_item in &drive_items {
@@ -324,7 +310,7 @@ impl UploadTask {
     }
 
     // Do some checks before uploading a file.
-    async fn maybe_upload_file(&self) -> Result<(), CommonError> {
+    async fn maybe_upload_file(&self) -> Result<()> {
         if self.existing_items.is_empty() {
             return self.do_upload_file().await;
         }
@@ -347,21 +333,21 @@ impl UploadTask {
 
     // Handle uploading a file when one or more drive items exist with
     // the same name on drive.
-    async fn handle_existing_items(&self) -> Result<(), CommonError> {
+    async fn handle_existing_items(&self) -> Result<()> {
         // Abort if any of the existing drive items is not a file.
         for item in &self.existing_items {
             match item.details {
                 DriveItemDetails::Directory { .. } => {
-                    return Err(CommonError::Generic(format!(
+                    return Err(anyhow!(
                         "{}: existing drive items is a folder, skipped",
                         self.item.path.display()
-                    )));
+                    ));
                 }
                 DriveItemDetails::Shortcut { .. } => {
-                    return Err(CommonError::Generic(format!(
+                    return Err(anyhow!(
                         "{}: existing drive items is a shortcut , skipped",
                         self.item.path.display()
-                    )));
+                    ));
                 }
                 _ => {}
             }
@@ -406,16 +392,10 @@ impl UploadTask {
     }
 
     // Upload the file contents to a new drive file.
-    async fn do_upload_file(&self) -> Result<(), CommonError> {
+    async fn do_upload_file(&self) -> Result<()> {
         let name = self.item.require_name()?;
-
-        let file = std::fs::File::open(&self.item.path).map_err(|err| {
-            CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
-        })?;
-
-        let metadata = file.metadata().map_err(|err| {
-            CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
-        })?;
+        let file = std::fs::File::open(&self.item.path)?;
+        let metadata = file.metadata()?;
 
         let mime_type = self
             .context
@@ -449,18 +429,12 @@ impl UploadTask {
         Ok(())
     }
 
-    async fn do_update_file(&self, drive_item: &DriveItem) -> Result<(), CommonError> {
+    async fn do_update_file(&self, drive_item: &DriveItem) -> Result<()> {
         match &drive_item.details {
             DriveItemDetails::File {
                 mime_type, size, ..
             } => {
-                let mime_type_mime = Mime::from_str(&mime_type).map_err(|err| {
-                    CommonError::Generic(format!(
-                        "{}: invalid mime type {}",
-                        mime_type,
-                        err.to_string()
-                    ))
-                })?;
+                let mime_type_mime = Mime::from_str(&mime_type)?;
                 let file_info = FileInfo {
                     name: drive_item.name.clone(),
                     mime_type: mime_type_mime,
@@ -468,9 +442,7 @@ impl UploadTask {
                     size: *size as u64,
                 };
 
-                let file = std::fs::File::open(&self.item.path).map_err(|err| {
-                    CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
-                })?;
+                let file = std::fs::File::open(&self.item.path)?;
 
                 let reader = std::io::BufReader::new(file);
 
@@ -482,18 +454,15 @@ impl UploadTask {
                         file_info,
                         self.context.delegate_config.clone(),
                     )
-                    .await
-                    .map_err(|err| {
-                        CommonError::Generic(format!("{}: {}", self.item.path.display(), err))
-                    })?;
+                    .await?;
 
                 Ok(())
             }
             DriveItemDetails::Directory { .. } | DriveItemDetails::Shortcut { .. } => {
-                return Err(CommonError::Generic(format!(
+                return Err(anyhow!(
                     "{}: existing drive items is not a file, skipped",
                     self.item.path.display()
-                )));
+                ));
             }
         }
     }

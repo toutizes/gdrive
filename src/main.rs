@@ -8,6 +8,7 @@ pub mod hub;
 pub mod permissions;
 pub mod version;
 
+use anyhow::{Result};
 use clap::{Parser, Subcommand};
 use common::delegate::ChunkSize;
 use common::permission;
@@ -24,11 +25,11 @@ struct Cli {
     command: Command,
 
     /// Only list what would be done.
-    #[arg(long, default_value="false")]
+    #[arg(long, default_value = "false")]
     pretend: Option<bool>,
 
     /// Number of workers to use for parallelising operations
-    #[arg(long, default_value="1")]
+    #[arg(long, default_value = "1")]
     workers: Option<usize>,
 }
 
@@ -408,7 +409,7 @@ enum PermissionCommand {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -559,8 +560,7 @@ async fn main() {
                         destination: dst,
                         workers: cli.workers.unwrap(),
                     })
-                    .await
-                    .unwrap_or_else(handle_error)
+                    .await?
                 }
 
                 FileCommand::Upload {
@@ -592,8 +592,7 @@ async fn main() {
                             force_mime_type: mime,
                         },
                     })
-                    .await
-                    .unwrap_or_else(handle_error)
+                    .await?
                 }
 
                 FileCommand::Update {
@@ -766,6 +765,7 @@ async fn main() {
             version::version()
         }
     }
+    Ok(())
 }
 
 fn handle_error(err: impl Error) {
