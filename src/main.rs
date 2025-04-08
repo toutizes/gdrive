@@ -680,8 +680,7 @@ async fn main() -> Result<()> {
                         parents: parent,
                         print_only_id,
                     })
-                    .await
-                    .unwrap_or_else(handle_error)
+                    .await?
                 }
 
                 FileCommand::Export {

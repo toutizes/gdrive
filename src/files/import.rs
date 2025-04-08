@@ -1,17 +1,8 @@
 use crate::common::delegate::UploadDelegateConfig;
-use crate::common::drive_file;
-use crate::common::drive_file::DocType;
+use crate::common::disk_item::DiskItem;
 use crate::common::drive_item::DriveItem;
-use crate::common::file_info;
-use crate::common::file_info::FileInfo;
 use crate::common::hub_helper;
-use crate::files;
-use crate::files::info::DisplayConfig;
-use std::error;
-use std::fmt::Display;
-use std::fmt::Formatter;
-use std::fs;
-use std::io;
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -21,83 +12,19 @@ pub struct Config {
     pub print_only_id: bool,
 }
 
-pub async fn import(config: Config) -> Result<(), Error> {
-    let hub = hub_helper::get_hub().await.map_err(Error::Hub)?;
+pub async fn import(config: Config) -> Result<()> {
+    let hub = hub_helper::get_hub().await?;
     let delegate_config = UploadDelegateConfig::default();
 
-    let doc_type =
-        drive_file::DocType::from_file_path(&config.file_path).ok_or(Error::UnsupportedFileType)?;
-    let mime_type = doc_type.mime().ok_or(Error::GetMime(doc_type.clone()))?;
+    let disk_item = DiskItem::for_path(&config.file_path);
 
-    let file = fs::File::open(&config.file_path)
-        .map_err(|err| Error::OpenFile(config.file_path.clone(), err))?;
+    let parents = match config.parents {
+        Some(parents) => parents,
+        None => vec![],
+    };
 
-    let file_info = FileInfo::from_file(
-        &file,
-        &file_info::Config {
-            file_path: config.file_path.clone(),
-            mime_type: Some(mime_type),
-            parents: config.parents.clone(),
-        },
-    )
-    .map_err(Error::FileInfo)?;
+    let drive_item = DriveItem::upload(&hub, &disk_item, &None, parents, delegate_config).await?;
 
-    let reader = std::io::BufReader::new(file);
-
-    if !config.print_only_id {
-        println!("Importing {} as a {}", config.file_path.display(), doc_type);
-    }
-
-    let file = DriveItem::upload(&hub, reader, None, file_info, delegate_config)
-        .await
-        .map_err(|err| Error::Generic(err.to_string()))?;
-
-    if config.print_only_id {
-        print!("{}", file.id.unwrap_or_default())
-    } else {
-        println!("File successfully imported");
-        let fields = files::info::prepare_fields(&file, &DisplayConfig::default());
-        files::info::print_fields(&fields);
-    }
-
+    print!("{}: imported {}", config.file_path.display(), drive_item.id);
     Ok(())
-}
-
-#[derive(Debug)]
-pub enum Error {
-    Hub(hub_helper::Error),
-    OpenFile(PathBuf, io::Error),
-    FileInfo(file_info::Error),
-    UploadFile(google_drive3::Error),
-    UnsupportedFileType,
-    GetMime(drive_file::DocType),
-    Generic(String),
-}
-
-impl error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Hub(err) => write!(f, "{}", err),
-            Error::OpenFile(path, err) => {
-                write!(f, "Failed to open file '{}': {}", path.display(), err)
-            }
-            Error::FileInfo(err) => write!(f, "Failed to get file info: {}", err),
-            Error::UploadFile(err) => {
-                write!(f, "Failed to upload file: {}", err)
-            }
-            Error::UnsupportedFileType => write!(
-                f,
-                "Unsupported file type, supported file types: {}",
-                DocType::supported_import_types().join(", ")
-            ),
-            Error::GetMime(doc_type) => write!(
-                f,
-                "Failed to get mime type from document type: {}",
-                doc_type
-            ),
-            Error::Generic(err) => write!(f, "{}", err),
-        }
-    }
 }

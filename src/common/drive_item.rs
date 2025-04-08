@@ -5,6 +5,9 @@ use crate::common::file_info::FileInfo;
 use crate::files::list;
 use crate::hub::Hub;
 use anyhow::{anyhow, Result};
+use futures::stream::StreamExt; // for `next()`
+use mime::Mime;
+use std::io::Write; // for `write_all()`
 
 #[derive(Debug, Clone)]
 pub enum DriveItemDetails {
@@ -119,45 +122,74 @@ impl DriveItem {
         }
     }
 
-    pub async fn upload<RS>(
+    pub async fn upload(
         hub: &Hub,
-        src_file: RS,
-        file_id: Option<String>,
-        file_info: FileInfo,
+        disk_item: &DiskItem,
+        force_mime_type: &Option<Mime>,
+        parent_id: Vec<String>,
         delegate_config: UploadDelegateConfig,
-    ) -> Result<google_drive3::api::File>
-    where
-        RS: google_drive3::client::ReadSeek,
-    {
-        println!("Upload file: {:?}: {:?}", file_id, file_info.name);
+    ) -> Result<DriveItem> {
+        let name = disk_item.require_name()?;
+        println!("{}: uploading", name);
+        let mime_type = if let Some(forced_mime_type) = &force_mime_type {
+            forced_mime_type.clone()
+        } else if let Ok(file_mime_type) = disk_item.mime_type() {
+            file_mime_type
+        } else {
+            mime::APPLICATION_OCTET_STREAM
+        };
         let dst_file = google_drive3::api::File {
-            id: file_id,
-            name: Some(file_info.name),
-            mime_type: Some(file_info.mime_type.to_string()),
-            parents: file_info.parents,
+            name: Some(name.clone()),
+            mime_type: Some(mime_type.to_string()),
+            parents: Some(parent_id.clone()),
             ..google_drive3::api::File::default()
         };
 
-        let chunk_size_bytes = delegate_config.chunk_size.in_bytes();
         let mut delegate = UploadDelegate::new(delegate_config);
 
         let req = hub
-        .files()
-        .create(dst_file)
-        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true);
+            .files()
+            .create(dst_file)
+            .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+            .add_scope(google_drive3::api::Scope::Full)
+            .delegate(&mut delegate)
+            .supports_all_drives(true);
 
-        let (_, file) = if file_info.size > chunk_size_bytes {
-            req.upload_resumable(src_file, file_info.mime_type)
-                .await?
-        } else {
-            req.upload(src_file, file_info.mime_type)
-                .await?
-        };
+        let (_, file) = req.upload_resumable(disk_item.reader()?, mime_type).await?;
+        DriveItem::from_drive_file(&file)
+    }
 
-        Ok(file)
+    pub async fn download(&self, hub: &Hub, disk_item: Option<&DiskItem>) -> Result<usize> {
+        match &self.details {
+            DriveItemDetails::File { md5, .. } => {
+                let (response, _) = hub
+                    .files()
+                    .get(&self.id)
+                    .supports_all_drives(true)
+                    .param("alt", "media")
+                    .add_scope(google_drive3::api::Scope::Full)
+                    .doit()
+                    .await?;
+
+                let mut body = response.into_body();
+                match &disk_item {
+                    Some(item) => item.overwrite(body, Some(md5.clone())).await,
+                    None => {
+                        let mut stdout = std::io::stdout();
+                        let mut written_bytes: usize = 0;
+                        while let Some(chunk_result) = body.next().await {
+                            let chunk = chunk_result?;
+                            stdout.write_all(&chunk)?;
+                            written_bytes += chunk.len();
+                        }
+                        Ok(written_bytes)
+                    }
+                }
+            }
+            DriveItemDetails::Directory {} | DriveItemDetails::Shortcut { .. } => {
+                Err(anyhow!("{}: not a file on Google Drive", self.name))
+            }
+        }
     }
 
     pub async fn update<RS>(
@@ -187,11 +219,9 @@ impl DriveItem {
         .supports_all_drives(true);
 
         let (_, file) = if file_info.size > 0 {
-            req.upload_resumable(src_file, file_info.mime_type)
-                .await?
+            req.upload_resumable(src_file, file_info.mime_type).await?
         } else {
-            req.upload(src_file, file_info.mime_type)
-                .await?
+            req.upload(src_file, file_info.mime_type).await?
         };
 
         Ok(file)

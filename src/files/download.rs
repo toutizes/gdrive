@@ -57,31 +57,20 @@ pub async fn download(config: Config) -> Result<()> {
         }
         file_id = id.clone();
     } else if let Some(ref name) = config.file_name {
-        file_id = drive_names::resolve(&hub, &name)
-            .await?;
+        file_id = drive_names::resolve(&hub, &name).await?;
     } else {
         return Err(anyhow!(
             "Either file_id or file_name must be specified".to_string(),
         ));
     }
 
-    let file = files::info::get_file(&hub, &file_id)
-        .await?;
+    let file = files::info::get_file(&hub, &file_id).await?;
     let item = DriveItem::from_drive_file(&file)?;
-
-    let dest: Option<PathBuf>;
-    match &config.destination {
-        Destination::Stdout => {
-            dest = None;
-        }
-        Destination::CurrentDir => {
-            dest = Some(PathBuf::from(""));
-        }
-
-        Destination::Path(path) => {
-            dest = Some(path.clone());
-        }
-    }
+    let dest = match &config.destination {
+        Destination::Stdout => None,
+        Destination::CurrentDir => Some(PathBuf::from("")),
+        Destination::Path(path) => Some(path.clone()),
+    };
 
     let tm = Arc::new(TaskManager::new(config.workers));
     let context = DownloadContext {
@@ -173,17 +162,12 @@ impl DownloadTask {
 
     pub async fn download(&self) -> Result<()> {
         match &self.item.details {
-            DriveItemDetails::Directory {} => {
-                self.download_directory().await?;
-            }
-            DriveItemDetails::File { ref md5, .. } => {
-                self.download_file(md5).await?;
-            }
+            DriveItemDetails::Directory {} => self.download_directory().await,
+            DriveItemDetails::File { ref md5, .. } => self.download_file(md5).await,
             DriveItemDetails::Shortcut { ref target_id, .. } => {
-                self.download_shortcut(target_id).await?;
+                self.download_shortcut(target_id).await
             }
         }
-        Ok(())
     }
 
     async fn download_directory(&self) -> Result<()> {
@@ -194,13 +178,8 @@ impl DownloadTask {
             ));
         }
 
-        let filepath: &PathBuf = self
-            .filepath
-            .as_ref()
-            .unwrap();
-
+        let filepath: &PathBuf = self.filepath.as_ref().unwrap();
         let num_dirs_created = create_dir_if_needed(filepath)?;
-
         let items =
             DriveItem::list_drive_dir(&self.context.hub, &Some(self.item.id.clone())).await?;
 
@@ -210,9 +189,7 @@ impl DownloadTask {
 
         for item in items {
             keep_names.insert(item.name.clone());
-
             let itempath = Some(filepath.join(&item.name));
-
             self.context
                 .tm
                 .add_task(DownloadTask::new(self.context.clone(), item, itempath));
@@ -221,8 +198,7 @@ impl DownloadTask {
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
         let mut num_files_deleted: usize = 0;
         if self.context.options.existing_file_action == ExistingFileAction::SyncLocal {
-            num_files_deleted = delete_extra_local_files(filepath, &keep_names)
-?;
+            num_files_deleted = delete_extra_local_files(filepath, &keep_names)?;
         }
 
         *(self.stats.lock().unwrap()) = DownloadStats {
@@ -290,8 +266,7 @@ impl DownloadTask {
     }
 
     async fn download_shortcut(&self, target_id: &String) -> Result<()> {
-        let target_file = files::info::get_file(&self.context.hub, target_id)
-            .await?;
+        let target_file = files::info::get_file(&self.context.hub, target_id).await?;
         let target_item = DriveItem::from_drive_file(&target_file)?;
         self.context.tm.add_task(DownloadTask::new(
             self.context.clone(),
@@ -325,15 +300,14 @@ fn create_dir_if_needed(path: &PathBuf) -> Result<usize> {
     if !path.exists() {
         println!("{}: created directory", path.display());
         fs::create_dir_all(&path)?;
-        return Ok(1);
+        Ok(1)
     } else {
-        let file_type = fs::metadata(&path)?
-            .file_type();
+        let file_type = fs::metadata(&path)?.file_type();
         if !file_type.is_dir() {
             return Err(anyhow!("{}: is not a directory, skipped", path.display()));
         }
+        Ok(0)
     }
-    Ok(0)
 }
 
 fn delete_extra_local_files(path: &PathBuf, names_to_keep: &HashSet<String>) -> Result<usize> {

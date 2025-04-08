@@ -393,39 +393,14 @@ impl UploadTask {
 
     // Upload the file contents to a new drive file.
     async fn do_upload_file(&self) -> Result<()> {
-        let name = self.item.require_name()?;
-        let file = std::fs::File::open(&self.item.path)?;
-        let metadata = file.metadata()?;
-
-        let mime_type = self
-            .context
-            .options
-            .force_mime_type
-            .clone()
-            .unwrap_or_else(|| {
-                mime_guess::from_path(&self.item.path)
-                    .first()
-                    .unwrap_or(mime::APPLICATION_OCTET_STREAM)
-            });
-
-        let file_info = FileInfo {
-            name: name.clone(),
-            mime_type,
-            size: metadata.len(),
-            parents: Some(self.parent_id.clone()),
-        };
-
-        let reader = std::io::BufReader::new(file);
-
-        let _file = DriveItem::upload(
+        DriveItem::upload(
             &self.context.hub,
-            reader,
-            None,
-            file_info,
+            &self.item,
+            &self.context.options.force_mime_type,
+            self.parent_id.clone(),
             self.context.delegate_config.clone(),
         )
         .await?;
-
         Ok(())
     }
 

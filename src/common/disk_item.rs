@@ -1,6 +1,11 @@
+use crate::common::drive_file::DocType;
+use crate::common::md5_writer::Md5Writer;
 use anyhow::{anyhow, Result};
+use futures::stream::StreamExt; // for `next()`
+use google_drive3::hyper;
+use mime::Mime;
 use std::fs::{DirEntry, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write}; // Write for `write_all()`
 use std::path::PathBuf;
 
 pub struct DiskItem {
@@ -22,25 +27,16 @@ impl DiskItem {
 
     pub fn list_dir(&self) -> Result<Vec<DiskItem>> {
         if !self.path.is_dir() {
-            return Err(anyhow!(
-                "{}: not a directory",
-                self.path.display(),
-            ));
+            return Err(anyhow!("{}: not a directory", self.path.display(),));
         }
 
-        let entries = std::fs::read_dir(&self.path).map_err(|err| {
-anyhow!("{} : {}", self.path.display(), err.to_string())
-        })?;
+        let entries = std::fs::read_dir(&self.path)
+            .map_err(|err| anyhow!("{} : {}", self.path.display(), err.to_string()))?;
 
         let mut disk_entries = Vec::new();
         for entry in entries {
-            let valid_entry = entry.map_err(|err| {
-                anyhow!(
-                    "In dir {}: {}",
-                    self.path.display(),
-                    err.to_string(),
-                )
-            })?;
+            let valid_entry = entry
+                .map_err(|err| anyhow!("In dir {}: {}", self.path.display(), err.to_string(),))?;
             disk_entries.push(DiskItem::for_dir_entry(&valid_entry)?);
         }
         Ok(disk_entries)
@@ -58,6 +54,54 @@ anyhow!("{} : {}", self.path.display(), err.to_string())
             Some(name) => Ok(name),
             None => Err(anyhow!("Filename is required")),
         }
+    }
+
+    pub fn reader(&self) -> Result<std::io::BufReader<std::fs::File>> {
+        Ok(std::io::BufReader::new(std::fs::File::open(&self.path)?))
+    }
+
+    pub fn mime_type(&self) -> Result<Mime> {
+        DocType::from_file_path(&self.path)
+            .ok_or(anyhow!("Unsupported file type"))?
+            .mime()
+            .ok_or(anyhow!("Unknown file type"))
+    }
+
+    pub async fn overwrite(
+        &self,
+        mut body: hyper::Body,
+        expected_md5: Option<String>,
+    ) -> Result<usize> {
+        // Create temporary file
+        let tmp_file_path = self.path.with_extension("incomplete");
+        // Wrap file in writer that calculates md5
+        let mut writer = Md5Writer::new(File::create(&tmp_file_path)?);
+
+        let mut written_bytes: usize = 0;
+
+        // Read chunks from stream and write to file
+        while let Some(chunk_result) = body.next().await {
+            let chunk = chunk_result?;
+            writer.write_all(&chunk)?;
+            written_bytes += chunk.len();
+        }
+
+        // Check md5
+        let actual_md5 = writer.md5();
+        if let Some(md5) = expected_md5 {
+            if md5 != actual_md5 {
+                return Err(anyhow!(
+                    "Mismatched md5 hashes. Expected {}, got {}",
+                    md5,
+                    actual_md5,
+                ));
+            }
+        }
+
+        // Rename temporary file to final file
+        std::fs::rename(&tmp_file_path, &self.path)?;
+
+        Ok(written_bytes)
     }
 
     pub fn matches_md5(&self, drive_md5: &String) -> bool {
