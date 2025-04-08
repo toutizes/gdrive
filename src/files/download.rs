@@ -1,5 +1,4 @@
 use crate::common::disk_item::DiskItem;
-use crate::common::drive_file_helper;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
 use crate::common::hub_helper;
@@ -213,9 +212,9 @@ impl DownloadTask {
     }
 
     async fn download_file(&self, md5: &String) -> Result<()> {
-        match &self.filepath {
+        let (disk_item, display_str): (Option<DiskItem>, String) = match &self.filepath {
             Some(filepath) => {
-                let options = &self.context.options;
+                let item = DiskItem::for_path(&filepath);
                 if filepath.exists() {
                     if filepath.is_dir() {
                         return Err(anyhow!(
@@ -223,45 +222,36 @@ impl DownloadTask {
                             filepath.display()
                         ));
                     }
-                    if options.existing_file_action == ExistingFileAction::Abort {
+                    if self.context.options.existing_file_action == ExistingFileAction::Abort {
                         return Err(anyhow!("{}: file exists, skipped.", filepath.display()));
                     }
-                    if DiskItem::for_path(filepath).matches_md5(md5) {
+                    if item.matches_md5(md5) {
                         return Ok(());
                     }
                 }
-                let start = Instant::now();
-                let file_bytes = drive_file_helper::download_file(
-                    &self.context.hub,
-                    &self.item.id,
-                    Some(md5.clone()),
-                    Some(&filepath),
-                )
-                .await?;
-                *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
-                let duration = start.elapsed();
-                println!("{}: {:.2}s", filepath.display(), duration.as_secs_f64());
-                *(self.stats.lock().unwrap()) = DownloadStats {
-                    num_files: 1,
-                    num_directories: 0,
-                    num_bytes: file_bytes,
-                    num_deleted_files: 0,
-                    num_errors: 0,
-                };
+                (Some(item), filepath.display().to_string())
             }
-            None => {
-                let file_bytes =
-                    drive_file_helper::download_file(&self.context.hub, &self.item.id, None, None)
-                        .await?;
-                *(self.stats.lock().unwrap()) = DownloadStats {
-                    num_files: 1,
-                    num_directories: 0,
-                    num_bytes: file_bytes,
-                    num_deleted_files: 0,
-                    num_errors: 0,
-                };
-            }
+            None => (None, self.item.id.clone())
         };
+        let start = Instant::now();
+        let file_bytes = self
+            .item
+            .download(&self.context.hub, disk_item.as_ref())
+            .await?;
+        let duration = start.elapsed();
+        println!(
+            "{}: {:.2}s",
+         display_str,
+            duration.as_secs_f64()
+        );
+        *(self.stats.lock().unwrap()) = DownloadStats {
+            num_files: 1,
+            num_directories: 0,
+            num_bytes: file_bytes,
+            num_deleted_files: 0,
+            num_errors: 0,
+        };
+        *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
         Ok(())
     }
 
