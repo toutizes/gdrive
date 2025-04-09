@@ -2,7 +2,7 @@ use crate::common::delegate::{UploadDelegate, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_file;
 use crate::common::file_info::FileInfo;
-use crate::files::list;
+use crate::files;
 use crate::hub::Hub;
 use anyhow::{anyhow, Result};
 use futures::stream::StreamExt; // for `next()`
@@ -32,6 +32,11 @@ pub struct DriveItem {
 }
 
 impl DriveItem {
+    pub async fn from_drive_id(hub: &Hub, drive_id: &String) -> Result<DriveItem> {
+        let file = files::info::get_file(&hub, &drive_id).await?;
+        DriveItem::from_drive_file(&file)
+    }
+
     pub fn from_drive_file(file: &google_drive3::api::File) -> Result<DriveItem> {
         let details: DriveItemDetails;
         if drive_file::is_directory(file) {
@@ -61,17 +66,17 @@ impl DriveItem {
     }
 
     pub async fn list_drive_dir(hub: &Hub, parent_id: &Option<String>) -> Result<Vec<DriveItem>> {
-        let query: list::ListQuery;
+        let query: files::list::ListQuery;
         if let Some(ref id) = parent_id {
-            query = list::ListQuery::FilesInFolder {
+            query = files::list::ListQuery::FilesInFolder {
                 folder_id: id.clone(),
             };
         } else {
-            query = list::ListQuery::RootNotTrashed;
+            query = files::list::ListQuery::RootNotTrashed;
         }
-        let files = list::list_files(
+        let files = files::list::list_files(
             hub,
-            &list::ListFilesConfig {
+            &files::list::ListFilesConfig {
                 query,
                 order_by: Default::default(),
                 max_files: usize::MAX,
@@ -185,6 +190,24 @@ impl DriveItem {
                         Ok(written_bytes)
                     }
                 }
+            }
+            DriveItemDetails::Directory {} | DriveItemDetails::Shortcut { .. } => {
+                Err(anyhow!("{}: not a file on Google Drive", self.name))
+            }
+        }
+    }
+
+    pub async fn export(&self, hub: &Hub, disk_item: &DiskItem) -> Result<usize> {
+        match &self.details {
+            DriveItemDetails::File { mime_type, .. } => {
+                let response = hub
+                    .files()
+                    .export(&self.id, &mime_type.to_string())
+                    .add_scope(google_drive3::api::Scope::Full)
+                    .doit()
+                    .await?;
+
+                disk_item.overwrite(response.into_body(), None).await
             }
             DriveItemDetails::Directory {} | DriveItemDetails::Shortcut { .. } => {
                 Err(anyhow!("{}: not a file on Google Drive", self.name))

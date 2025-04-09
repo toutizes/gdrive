@@ -1,14 +1,10 @@
-use crate::common::drive_file;
-use crate::common::drive_file_helper;
+use crate::common::disk_item::DiskItem;
 use crate::common::drive_file::DocType;
 use crate::common::drive_file::FileExtension;
+use crate::common::drive_item::{DriveItem, DriveItemDetails};
 
 use crate::common::hub_helper;
-use crate::files;
-use anyhow;
-use std::error;
-use std::fmt::Display;
-use std::fmt::Formatter;
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -24,113 +20,48 @@ pub enum ExistingFileAction {
     Overwrite,
 }
 
-pub async fn export(config: Config) -> Result<(), Error> {
-    let hub = hub_helper::get_hub().await.map_err(Error::Hub)?;
+pub async fn export(config: Config) -> Result<()> {
+    let hub = hub_helper::get_hub().await?;
 
-    err_if_file_exists(&config)?;
+    let filepath = &config.file_path;
 
-    let file = files::info::get_file(&hub, &config.file_id)
-        .await
-        .map_err(Error::GetFile)?;
+    if filepath.exists() && config.existing_file_action == ExistingFileAction::Abort {
+        Err(anyhow!(
+            "{}: file exist, use --overwrite to export",
+            filepath.display(),
+        ))?;
+    }
 
-    let drive_mime = file.mime_type.ok_or(Error::MissingDriveMime)?;
-    let doc_type = DocType::from_mime_type(&drive_mime)
-        .ok_or(Error::UnsupportedDriveMime(drive_mime.clone()))?;
+    let drive_item = DriveItem::from_drive_id(&hub, &config.file_id).await?;
 
-    let extension = FileExtension::from_path(&config.file_path)
-        .ok_or(Error::UnsupportedExportExtension(doc_type.clone()))?;
+    match &drive_item.details {
+        DriveItemDetails::File { mime_type, .. } => {
+            let doc_type: DocType = DocType::from_mime_type(&mime_type).ok_or(anyhow!(
+                "{}: unsupported drive mime type {}",
+                filepath.display(),
+                mime_type
+            ))?;
 
-    err_if_unsupported(&doc_type, &extension)?;
+            let extension = FileExtension::from_path(&filepath).ok_or(anyhow!(
+                "{}: Cannot guess a mime type from the filename",
+                config.file_path.display(),
+            ))?;
 
-    let mime_type = extension
-        .get_export_mime()
-        .ok_or(Error::GetFileExtensionMime(extension.clone()))?;
-
-    let _file_bytes = drive_file_helper::export_file(
-        &hub, &config.file_id, &mime_type, file.md5_checksum, &config.file_path)
-        .await
-        .map_err(Error::ExportFile)?;
-
+            if !doc_type.can_export_to(&extension) {
+                return Err(anyhow!(
+                    "{}: cannot export drive file with type {}",
+                    filepath.display(),
+                    doc_type
+                ));
+            };
+            let disk_item = DiskItem::for_path(&config.file_path);
+            drive_item.export(&hub, &disk_item).await?;
+        }
+        DriveItemDetails::Directory {} | DriveItemDetails::Shortcut { .. } => {
+            Err(anyhow!("{}: not a file on Google Drive", drive_item.id))?;
+        }
+    };
     println!("Successfully exported {}", config.file_path.display());
 
     Ok(())
-}
-
-#[derive(Debug)]
-pub enum Error {
-    Hub(hub_helper::Error),
-    FileExists(PathBuf),
-    GetFile(google_drive3::Error),
-    ExportFile(anyhow::Error),
-    MissingDriveMime,
-    UnsupportedDriveMime(String),
-    GetFileExtensionMime(drive_file::FileExtension),
-    UnsupportedExportExtension(DocType),
-    SaveFile(anyhow::Error),
-}
-
-impl error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Hub(err) => write!(f, "{}", err),
-            Error::FileExists(path) => {
-                write!(
-                    f,
-                    "File '{}' already exists, use --overwrite to overwrite it",
-                    path.display()
-                )
-            }
-            Error::GetFile(err) => {
-                write!(f, "Failed to get file: {}", err)
-            }
-            Error::ExportFile(err) => {
-                write!(f, "Failed to export file: {}", err)
-            }
-            Error::MissingDriveMime => write!(f, "Drive file does not have a mime type"),
-            Error::UnsupportedDriveMime(mime) => {
-                write!(f, "Mime type on drive file '{}' is not supported", mime)
-            }
-            Error::GetFileExtensionMime(doc_type) => write!(
-                f,
-                "Failed to get mime type from file extension: {}",
-                doc_type
-            ),
-            Error::UnsupportedExportExtension(doc_type) => {
-                let supported_types = doc_type
-                    .supported_export_types()
-                    .iter()
-                    .map(|ext| ext.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                write!(
-                    f,
-                    "Export of a {} to this file type is not supported, supported file types are: {}",
-                    doc_type,
-                    supported_types
-                )
-            }
-            Error::SaveFile(err) => {
-                write!(f, "Failed to save file: {}", err)
-            }
-        }
-    }
-}
-
-fn err_if_file_exists(config: &Config) -> Result<(), Error> {
-    if config.file_path.exists() && config.existing_file_action == ExistingFileAction::Abort {
-        Err(Error::FileExists(config.file_path.clone()))
-    } else {
-        Ok(())
-    }
-}
-
-fn err_if_unsupported(doc_type: &DocType, extension: &FileExtension) -> Result<(), Error> {
-    if !doc_type.can_export_to(extension) {
-        Err(Error::UnsupportedExportExtension(doc_type.clone()))
-    } else {
-        Ok(())
-    }
 }

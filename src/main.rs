@@ -699,8 +699,7 @@ async fn main() -> Result<()> {
                         file_path,
                         existing_file_action,
                     })
-                    .await
-                    .unwrap_or_else(handle_error)
+                    .await?
                 }
             }
         }
