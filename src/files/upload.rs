@@ -236,15 +236,14 @@ impl UploadTask {
             self.context.tm.add_task(task);
         }
 
-        // In sync mode, delete drive files that do not exist on the local disk.
-        for drive_item in &drive_items {
-            if !disk_item_set.contains(&drive_item.name) {
-                println!(
-                    "{}: deleting existing file ({})",
-                    self.item.path.display(),
-                    drive_item.id
-                );
-                drive_item.delete(&self.context.hub).await?;
+        // If in sync mode, delete drive files that do not exist on the local disk.
+        if self.context.options.existing_file_action == ExistingDriveFileAction::Sync {
+            for drive_item in &drive_items {
+                if !disk_item_set.contains(&drive_item.name) {
+                    // TODO: Show the Google Drive path when known.
+                    println!("{}: deleting existing file", drive_item.name);
+                    drive_item.delete(&self.context.hub).await?;
+                }
             }
         }
 
@@ -254,7 +253,16 @@ impl UploadTask {
     // Do some checks before uploading a file.
     async fn maybe_upload_file(&self) -> Result<()> {
         if self.existing_items.is_empty() {
-            return self.do_upload_file().await;
+            println!("{}: uploading to Google Drive", self.item.path.display());
+            DriveItem::upload(
+                &self.context.hub,
+                &self.item,
+                &self.context.options.force_mime_type,
+                self.parent_id.clone(),
+                self.context.delegate_config.clone(),
+            )
+            .await?;
+            return Ok(());
         }
         match self.context.options.existing_file_action {
             ExistingDriveFileAction::Skip => {
@@ -262,85 +270,50 @@ impl UploadTask {
                     "{}: exists in Google Drive, skipped. Use --overwrite or --sync to replace",
                     self.item.path.display()
                 );
-                return Ok(());
+                Ok(())
             }
             ExistingDriveFileAction::Sync | ExistingDriveFileAction::Replace => {
-                return self.handle_existing_items().await;
-            }
-        }
-    }
-
-    // Handle uploading a file when one or more drive items exist with
-    // the same name on drive.
-    async fn handle_existing_items(&self) -> Result<()> {
-        // Abort if any of the existing drive items is not a file.
-        for item in &self.existing_items {
-            match item.details {
-                DriveItemDetails::Directory { .. } => {
-                    return Err(anyhow!(
-                        "{}: existing drive items is a folder, skipped",
-                        self.item.path.display()
-                    ));
+                if self.existing_items.len() > 1 {
+                    println!(
+                        "{}: {} items with the same name on Google Drive, skipped",
+                        self.item.path.display(),
+                        self.existing_items.len()
+                    );
+                    return Ok(());
                 }
-                DriveItemDetails::Shortcut { .. } => {
-                    return Err(anyhow!(
-                        "{}: existing drive items is a shortcut , skipped",
-                        self.item.path.display()
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        // Update the first existing item and delete the others.
-        // MAYBE: Find a "best match" to update?
-        if self.context.options.existing_file_action == ExistingDriveFileAction::Sync {
-            for i in 0..self.existing_items.len() {
-                let drive_item = &self.existing_items[i];
-                if i == 0 {
-                    // Update the first item
-                    if let DriveItemDetails::File { md5, .. } = &drive_item.details {
+                let existing_item = &self.existing_items[0];
+                match &existing_item.details {
+                    DriveItemDetails::Directory { .. } => {
+                        println!(
+                            "{}: is a folder on Google Drive, skipped",
+                            self.item.path.display()
+                        );
+                        Ok(())
+                    }
+                    DriveItemDetails::Shortcut { .. } => {
+                        println!(
+                            "{}: is a shortcut on Google Drive, skipped",
+                            self.item.path.display()
+                        );
+                        Ok(())
+                    }
+                    DriveItemDetails::File { md5, .. } => {
                         if self.item.matches_md5(&md5) {
                             println!(
-                                "{}: file already exists and is identical ({})",
-                                self.item.path.display(),
-                                drive_item.id
+                                "{}: file already exists and is identical on Google Drive, skipped",
+                                self.item.path.display()
                             );
                             return Ok(());
                         }
+                        println!(
+                            "{}: updating existing Google Drive file",
+                            self.item.path.display()
+                        );
+                        self.do_update_file(existing_item).await
                     }
-                    println!(
-                        "{}: updating existing file (id {})",
-                        self.item.path.display(),
-                        drive_item.id
-                    );
-                    self.do_update_file(&self.existing_items[0]).await?;
-                } else {
-                    // Delete the rest
-                    println!(
-                        "{}: deleting existing file (id {})",
-                        self.item.path.display(),
-                        drive_item.id
-                    );
-                    self.existing_items[i].delete(&self.context.hub).await?;
                 }
             }
         }
-
-        Ok(())
-    }
-
-    // Upload the file contents to a new drive file.
-    async fn do_upload_file(&self) -> Result<()> {
-        DriveItem::upload(
-            &self.context.hub,
-            &self.item,
-            &self.context.options.force_mime_type,
-            self.parent_id.clone(),
-            self.context.delegate_config.clone(),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn do_update_file(&self, drive_item: &DriveItem) -> Result<()> {

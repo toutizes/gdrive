@@ -135,7 +135,6 @@ impl DriveItem {
         delegate_config: UploadDelegateConfig,
     ) -> Result<DriveItem> {
         let name = disk_item.require_name()?;
-        println!("{}: uploading", name);
         let mime_type = if let Some(forced_mime_type) = &force_mime_type {
             forced_mime_type.clone()
         } else if let Ok(file_mime_type) = disk_item.mime_type() {
