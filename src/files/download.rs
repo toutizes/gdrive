@@ -21,21 +21,6 @@ pub struct DownloadOptions {
     pub download_directories: bool,
 }
 
-pub struct Config {
-    pub file_id: Option<String>,
-    pub file_name: Option<String>,
-    pub destination: Destination,
-    pub options: DownloadOptions,
-    pub workers: usize,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Destination {
-    CurrentDir,
-    Path(PathBuf),
-    Stdout,
-}
-
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ExistingFileAction {
     Abort,
@@ -43,42 +28,29 @@ pub enum ExistingFileAction {
     SyncLocal,
 }
 
-pub async fn download(config: Config) -> Result<()> {
+pub async fn download(
+    drive_path: &String,
+    destination: &Option<PathBuf>,
+    options: &DownloadOptions,
+    workers: usize,
+) -> Result<()> {
     let start = Instant::now();
     let hub = Arc::new(hub_helper::get_hub().await?);
 
-    let file_id: String;
-    if let Some(ref id) = config.file_id {
-        if config.file_name.is_some() {
-            return Err(anyhow!(
-                "Only one of file_id or file_name can be specified".to_string(),
-            ));
-        }
-        file_id = id.clone();
-    } else if let Some(ref name) = config.file_name {
-        file_id = drive_names::resolve(&hub, &name).await?;
-    } else {
-        return Err(anyhow!(
-            "Either file_id or file_name must be specified".to_string(),
-        ));
-    }
+    let resolved_id: String = drive_names::resolve(&hub, drive_path)
+        .await?
+        .ok_or(anyhow!("{}: cannot download that path", drive_path))?;
+    let file = files::info::get_file(&hub, &resolved_id).await?;
+    let drive_item = DriveItem::from_drive_file(&file)?;
 
-    let file = files::info::get_file(&hub, &file_id).await?;
-    let item = DriveItem::from_drive_file(&file)?;
-    let dest = match &config.destination {
-        Destination::Stdout => None,
-        Destination::CurrentDir => Some(PathBuf::from("")),
-        Destination::Path(path) => Some(path.clone()),
-    };
-
-    let tm = Arc::new(TaskManager::new(config.workers));
+    let tm = Arc::new(TaskManager::new(workers));
     let context = DownloadContext {
         hub: hub.clone(),
         tm: tm.clone(),
-        options: (&config.options).clone(),
+        options: options.clone(),
     };
 
-    tm.add_task(DownloadTask::new(context.clone(), item, dest));
+    tm.add_task(DownloadTask::new(context.clone(), drive_item, destination.clone()));
     let tasks = tm.wait().await;
     report_stats(tasks, start.elapsed());
     Ok(())
@@ -231,7 +203,7 @@ impl DownloadTask {
                 }
                 (Some(item), filepath.display().to_string())
             }
-            None => (None, self.item.id.clone())
+            None => (None, self.item.id.clone()),
         };
         let start = Instant::now();
         let file_bytes = self
@@ -239,11 +211,7 @@ impl DownloadTask {
             .download(&self.context.hub, disk_item.as_ref())
             .await?;
         let duration = start.elapsed();
-        println!(
-            "{}: {:.2}s",
-         display_str,
-            duration.as_secs_f64()
-        );
+        println!("{}: {:.2}s", display_str, duration.as_secs_f64());
         *(self.stats.lock().unwrap()) = DownloadStats {
             num_files: 1,
             num_directories: 0,

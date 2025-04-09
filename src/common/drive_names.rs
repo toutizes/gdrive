@@ -9,15 +9,29 @@ struct DriveIdAndIsDirectory {
 }
 
 // Find the drive id of `filepath`.
-// Returns an error if the file is not found.
 //
-// TODO: Support <drive name>:path/path/file
-pub async fn resolve(hub: &Hub, filepath: &String) -> Result<String> {
+// Returns a drive id or None if the filepath specifies the root of the drive..
+//
+// - If the path is empty, we return None, to indicate "the root of the drive".
+// - If the path starts with a `/`, it is a unix-like path starting at the root of the drive,
+//   we find a doc with the matching name in google drive and return its id or an error.
+// - Otherwise we assume it is a drive file id and we return it as-is.
+pub async fn resolve(hub: &Hub, filepath: &String) -> Result<Option<String>> {
+    if filepath.is_empty() {
+        // Root of the drive.
+        return Ok(None);
+    } else if !filepath.starts_with("/") {
+        // We assume it is a drive file id.
+        return Ok(Some(filepath.clone()));
+    }
+
+    // Look for a file with the right name.
     let mut last_found = DriveIdAndIsDirectory {
         id: None,
         is_dir: false,
     };
 
+    // MAYBE: handle '/' in drive filenames?
     for part in filepath.split("/").filter(|s| !s.is_empty()) {
         let query = make_query(filepath, &last_found)?;
 
@@ -35,7 +49,7 @@ pub async fn resolve(hub: &Hub, filepath: &String) -> Result<String> {
     }
 
     if let Some(id) = last_found.id {
-        return Ok(id.clone());
+        return Ok(Some(id.clone()));
     }
     Err(anyhow!("{}: Empty path", filepath))
 }

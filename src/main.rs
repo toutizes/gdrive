@@ -8,7 +8,7 @@ pub mod hub;
 pub mod permissions;
 pub mod version;
 
-use anyhow::{Result};
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use common::delegate::ChunkSize;
 use common::permission;
@@ -163,70 +163,138 @@ enum FileCommand {
         field_separator: String,
     },
 
-    /// Download file
+    /// Download a file or a folder from Google Drive to the local
+    /// disk.
+    ///
+    /// If you do not pass --destination <LOCAL FOLDER> the files is
+    /// downloaded to the current directory. See also --stdout.
+    ///
+    /// To download a Google Drive folder you must pass --recursive.
+    ///
+    /// By default gdrive does not overwrite files that are already
+    /// present on the local disk. See --overwrite and --sync for
+    /// other options.
+    ///
+    /// When downloading a folder, it is an error if a folder contains
+    /// multiple files with the same name.
+    ///
+    /// By default Google Drive shortcuts are ignored. See
+    /// --follow-shortcuts to follow them.
     Download {
-        /// File id
-        #[arg(long)]
-        file_id: Option<String>,
+        /// Name of the Google Drive file or folder to download.
+        ///
+        /// If the name starts with a / it is interpreted as a Google Drive
+        /// path, such as /<folder name>/<file name> or
+        /// /<folder name>/<folder name>.
+        ///
+        /// If the name does not start with a / it must be a Google
+        /// Drive item id, as returned by "gdrive list". You can use
+        /// that to unambiguously download one of multiple files with
+        /// the same name from a Google Drive folder.
+        #[arg(value_name = "DRIVE FILE OR FOLDER", required = true)]
+        drive_path: String,
 
-        /// File name
-        #[arg(long)]
-        file_name: Option<String>,
-
-        /// Overwrite existing files and folders
-        #[arg(long)]
-        overwrite: bool,
-
-        /// Overwrite existing files and folders, delete local files that are not on drive
-        #[arg(long)]
-        sync: bool,
-
-        /// Follow shortcut and download target file (does not work with recursive download)
-        #[arg(long)]
-        follow_shortcuts: bool,
-
-        /// Download directories
-        #[arg(long)]
-        recursive: bool,
-
-        /// Path where the file/directory should be downloaded to
-        #[arg(long, value_name = "PATH")]
+        /// Local path where the Google Drive or folder will be
+        /// downloaded.  Must already exist as a directory on the
+        /// local disk. Defaults to the current directory.
+        #[arg(long, value_name = "LOCAL FOLDER")]
         destination: Option<PathBuf>,
 
-        /// Write file to stdout
+        /// Recursively download folders. This must be specified when
+        /// the path to download is a Google Drive folder.
+        #[arg(long, short = 'r')]
+        recursive: bool,
+
+        /// Files that already exists on the local disk are
+        /// overwritten with their Google Drive current version.
+        ///
+        /// To save bandwidth files that are identical to the local
+        /// version are not downloaded.
+        #[arg(long, short = 'f')]
+        overwrite: bool,
+
+        /// Like --overwrite plus, when recursively downloading a
+        /// folder, also DELETES local files that are not present in
+        /// the Google Drive folder.
+        ///
+        /// Exception: gdrive never deletes a local folder, only local
+        /// files.
+        #[arg(long, short = 's')]
+        sync: bool,
+
+        /// Instead of creating files, just emit the contents of the
+        /// downloaded files to the output of the gdrive command.
+        /// Might be useful when downloading a single file.
         #[arg(long)]
-        stdout: bool,
+        stdout: Option<bool>,
+
+        // TODO: review
+        /// Follow Google Drive shortcuts, and download the Google
+        /// Drive items they point to.
+        #[arg(long)]
+        follow_shortcuts: bool,
     },
 
-    /// Upload file
+    /// Upload a file or a folder from the local disk to Google Drive.
+    ///
+    /// If you do not pass --destination <DRIVE FOLDER>, the file or
+    /// folder is uploaded at the root of Google Drive.
+    ///
+    /// To upload a folder, you must pass --recursive.
+    ///
+    /// By default, gdrive does not overwrite files that are already
+    /// present on Google Drive. See --overwrite and --sync for
+    /// other options.
+    ///
+    /// By default, Google Drive shortcuts are ignored. See
+    /// --follow-shortcuts to follow them.
     Upload {
-        /// Path of file to upload
-        file_path: Option<PathBuf>,
+        /// Local path of the file or folder to upload.
+        #[arg(value_name = "LOCAL_FILE_OR_FOLDER", required = true)]
+        file_path: PathBuf,
 
+        /// Optional Google Drive folder where the uploaded contents
+        /// go. Defaults to the Google Drive root folder.
+        ///
+        /// If the name starts with a / it is interpreted as a Google Drive
+        /// path, such as /<folder name>/<folder name>...  You can pass
+        /// just / to represent the Google Drive root.
+        ///
+        /// If the name does not start with a / it must be a Google
+        /// Drive item id, as returned by "gdrive list".
+        #[arg(long, value_name = "DRIVE FOLDER", aliases = &["parent"], default_value="/")]
+        destination: String,
+
+        /// Recursively upload folders. This must be specified when
+        /// the path to upload is a local folder.
+        #[arg(long, short = 'r')]
+        recursive: bool,
+
+        /// Overwrite files already present on Google Drive with the
+        /// local version.
+        ///
+        /// It is an error if a Google Drive folder contains multiple
+        /// files with the same name as one of the files to upload.
+        ///
+        /// To save bandwidth files that are identical to the Google
+        /// Drive version are not uploaded.
+        #[arg(long, short = 'f')]
+        overwrite: bool,
+
+        /// Like --overwrite plus, when recursively uploading a
+        /// folder, also DELETES Google Drive files that are not
+        /// present in the local folder. Exception: gdrive never
+        /// deletes a Google Drive folder, only Google Drive files.
+        ///
+        /// It is an error if a Google Drive folder contains
+        /// multiple files with the same name.
+        #[arg(long, short = 's')]
+        sync: bool,
+
+        // TODO: Review parameters below.
         /// Force mime type [default: auto-detect]
         #[arg(long, value_name = "MIME_TYPE")]
         mime: Option<Mime>,
-
-        /// Upload to an existing directory by drive id
-        #[arg(long, value_name = "DIRECTORY_ID")]
-        parent: Option<Vec<String>>,
-
-        /// Upload to an existing directory by drive path
-        #[arg(long, value_name = "DIRECTORY_ID")]
-        parent_path: Option<Vec<String>>,
-
-        /// Upload directories. Note that this will always create a new directory on drive and will not update existing directories with the same name
-        // TODO: add --overwrite and --sync
-        #[arg(long)]
-        recursive: bool,
-
-        #[arg(long, value_enum, default_value_t = files::upload::ExistingDriveFileAction::Skip,
-              help = "What to do if a file with the same name already exists in Google Drive:\n\
- - skip: skip uploading the local file, the Drive file will not be modified.\n\
- - replace: replace the existing Drive file with the local file.\n\
- - upload-anyway: ignore the existing Drive file and upload the local file anyway. You end up with two files with the same name in Google Drive.\n\
- - sync: like `replace` but also deletes files from Google Drive if they do not exist locally.\n")]
-        existing_file_action: files::upload::ExistingDriveFileAction,
 
         /// Set chunk size in MB, must be a power of two.
         #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
@@ -243,7 +311,6 @@ enum FileCommand {
         /// Print only id of file/folder
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
-        // TODO: add --overwrite and --sync
     },
 
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
@@ -524,15 +591,19 @@ async fn main() -> Result<()> {
                 }
 
                 FileCommand::Download {
-                    file_id,
-                    file_name,
+                    drive_path,
+                    destination,
+                    recursive,
                     overwrite,
                     sync,
                     follow_shortcuts,
-                    recursive,
-                    destination,
                     stdout,
                 } => {
+                    if sync && overwrite {
+                        return Err(anyhow!(
+                            "Only one of --sync and --overwrite can be specified"
+                        ));
+                    }
                     let existing_file_action = if sync {
                         files::download::ExistingFileAction::SyncLocal
                     } else if overwrite {
@@ -541,57 +612,66 @@ async fn main() -> Result<()> {
                         files::download::ExistingFileAction::Abort
                     };
 
-                    let dst = if stdout {
-                        files::download::Destination::Stdout
-                    } else if let Some(path) = destination {
-                        files::download::Destination::Path(path)
+                    let dst: Option<PathBuf>;
+                    if !stdout.is_none() {
+                        if !destination.is_none() {
+                            return Err(anyhow!(
+                                "Only one of --stdout and --destination can be specified"
+                            ));
+                        }
+                        dst = None;
                     } else {
-                        files::download::Destination::CurrentDir
-                    };
+                        dst = destination;
+                    }
 
-                    files::download(files::download::Config {
-                        file_id,
-                        file_name,
-                        options: files::download::DownloadOptions {
-                            existing_file_action,
-                            follow_shortcuts,
-                            download_directories: recursive,
-                        },
-                        destination: dst,
-                        workers: cli.workers.unwrap(),
-                    })
-                    .await?
+                    let options = files::download::DownloadOptions {
+                        existing_file_action,
+                        follow_shortcuts,
+                        download_directories: recursive,
+                    };
+                    files::download(&drive_path, &dst, &options, cli.workers.unwrap()).await?
                 }
 
                 FileCommand::Upload {
                     file_path,
-                    mime,
-                    parent,
-                    parent_path,
+                    destination,
                     recursive,
-                    existing_file_action,
+                    overwrite,
+                    sync,
+                    mime,
                     chunk_size,
                     print_chunk_errors,
                     print_chunk_info,
                     print_only_id,
                 } => {
-                    // fmt
-                    files::upload(files::upload::Config {
-                        file_path,
-                        parents: parent,
-                        parent_paths: parent_path,
-                        chunk_size,
+                    if sync && overwrite {
+                        return Err(anyhow!(
+                            "Only one of --sync and --overwrite can be specified"
+                        ));
+                    }
+                    let existing_file_action = if sync {
+                        files::upload::ExistingDriveFileAction::Sync
+                    } else if overwrite {
+                        files::upload::ExistingDriveFileAction::Replace
+                    } else {
+                        files::upload::ExistingDriveFileAction::Skip
+                    };
+
+                    let options = files::upload::UploadOptions {
+                        existing_file_action,
+                        upload_directories: recursive,
+                        force_mime_type: mime,
+                    };
+                    files::upload(
+                        &file_path,
+                        &destination,
+                        &options,
+                        &chunk_size,
                         print_chunk_errors,
                         print_chunk_info,
                         print_only_id,
-                        workers: cli.workers.unwrap(),
-                        pretend: cli.pretend.unwrap(),
-                        options: files::upload::UploadOptions {
-                            existing_file_action,
-                            upload_directories: recursive,
-                            force_mime_type: mime,
-                        },
-                    })
+                        cli.workers.unwrap(),
+                    )
                     .await?
                 }
 

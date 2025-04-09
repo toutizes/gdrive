@@ -143,12 +143,16 @@ impl DriveItem {
         } else {
             mime::APPLICATION_OCTET_STREAM
         };
-        let dst_file = google_drive3::api::File {
+        let mut dst_file = google_drive3::api::File {
             name: Some(name.clone()),
             mime_type: Some(mime_type.to_string()),
-            parents: Some(parent_id.clone()),
             ..google_drive3::api::File::default()
         };
+
+        // Do not put parent to upload at the root of the drive.
+        if !parent_id.is_empty() {
+            dst_file.parents = Some(parent_id.clone());
+        }
 
         let mut delegate = UploadDelegate::new(delegate_config);
 

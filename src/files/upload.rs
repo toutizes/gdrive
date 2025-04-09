@@ -2,7 +2,6 @@ use crate::common::delegate::{BackoffConfig, ChunkSize, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
 use crate::common::drive_names;
-use crate::common::file_helper;
 use crate::common::file_info::FileInfo;
 use crate::common::hub_helper;
 use crate::files::mkdir;
@@ -22,7 +21,6 @@ use std::time::Duration;
 pub enum ExistingDriveFileAction {
     Skip,
     Replace,
-    UploadAnyway,
     Sync,
 }
 
@@ -33,98 +31,50 @@ pub struct UploadOptions {
     pub force_mime_type: Option<Mime>,
 }
 
-pub struct Config {
-    pub file_path: Option<PathBuf>,
-    pub parents: Option<Vec<String>>,
-    pub parent_paths: Option<Vec<String>>,
-    pub chunk_size: ChunkSize,
-    pub print_chunk_errors: bool,
-    pub print_chunk_info: bool,
-    pub print_only_id: bool,
-    pub workers: usize,
-    pub pretend: bool,
-    pub options: UploadOptions,
-}
-
-pub async fn upload(cl_config: Config) -> Result<()> {
+pub async fn upload(
+    file_path: &PathBuf,
+    destination: &String,
+    options: &UploadOptions,
+    chunk_size: &ChunkSize,
+    print_chunk_errors: bool,
+    print_chunk_info: bool,
+    _print_only_id: bool,
+    workers: usize,
+) -> Result<()> {
     let hub = Arc::new(hub_helper::get_hub().await?);
 
-    let config = config_to_use(&hub, cl_config).await?;
-
     let delegate_config = UploadDelegateConfig {
-        chunk_size: config.chunk_size.clone(),
+        chunk_size: chunk_size.clone(),
         backoff_config: BackoffConfig {
             max_retries: 100000,
             min_sleep: Duration::from_secs(1),
             max_sleep: Duration::from_secs(60),
         },
-        print_chunk_errors: config.print_chunk_errors,
-        print_chunk_info: config.print_chunk_info,
+        print_chunk_errors,
+        print_chunk_info,
     };
 
-    match config.file_path {
-        Some(_) => {
-            return upload_item(hub.clone(), config, delegate_config).await;
-        }
-        None => {
-            let tmp_file = file_helper::stdin_to_file()?;
+    let tm = Arc::new(TaskManager::new(workers));
+    let disk_item = DiskItem::for_path(&file_path);
 
-            return upload_item(
-                hub.clone(),
-                Config {
-                    file_path: Some(tmp_file.as_ref().to_path_buf()),
-                    ..config
-                },
-                delegate_config,
-            )
-            .await;
-        }
-    };
-}
+    let resolved_id = drive_names::resolve(&hub, destination).await?;
+    let existing_items = DriveItem::from_disk_item(&hub, &disk_item, &resolved_id).await?;
 
-async fn config_to_use(hub: &Hub, config: Config) -> Result<Config> {
-    if let Some(ref paths) = config.parent_paths {
-        if config.parents.is_some() {
-            return Err(anyhow!(
-                "Only one of --parent or --parent-path can be specified"
-            ));
-        }
-        let mut parents = Vec::new();
-        for path in paths.iter() {
-            parents.push(drive_names::resolve(&hub, &path).await?);
-        }
-        Ok(Config {
-            parents: Some(parents),
-            ..config
-        })
-    } else if config.parents.is_none() {
-        Err(anyhow!("Must pass one of --parent or --parent-path"))
+    let parents: Vec<String> = if let Some(parent_id) = resolved_id {
+        vec![parent_id.clone()]
     } else {
-        Ok(config)
-    }
-}
-
-pub async fn upload_item(
-    hub: Arc<Hub>,
-    config: Config,
-    delegate_config: UploadDelegateConfig,
-) -> Result<()> {
-    if config.file_path.is_none() {
-        return Err(anyhow!("File path is required".to_string()));
-    }
-    let tm = Arc::new(TaskManager::new(config.workers));
-    let item = DiskItem::for_path(&config.file_path.as_ref().unwrap());
-    let existing_items = DriveItem::from_disk_item(&hub, &item, &single_parent(&config)).await?;
+        vec![]
+    };
 
     let task = UploadTask::new(
         UploadContext {
             hub: hub.clone(),
             tm: tm.clone(),
             delegate_config,
-            options: config.options.clone(),
+            options: options.clone(),
         },
-        item,
-        config.parents.clone().unwrap_or_default(),
+        disk_item,
+        parents,
         existing_items,
     );
 
@@ -132,15 +82,6 @@ pub async fn upload_item(
     tm.wait().await;
 
     Ok(())
-}
-
-fn single_parent(config: &Config) -> Option<String> {
-    if let Some(parents) = &config.parents {
-        if parents.len() == 1 {
-            return parents.first().cloned();
-        }
-    }
-    None
 }
 
 #[derive(Clone)]
@@ -154,6 +95,7 @@ pub struct UploadContext {
 pub struct UploadTask {
     context: UploadContext,
     item: DiskItem,
+    // Parent where to upload. TODO: make it an Option<DriveItem> with None => root.
     parent_id: Vec<String>,
     // List of items with the name item.name in the parent_id folder.
     existing_items: Vec<DriveItem>,
@@ -317,16 +259,13 @@ impl UploadTask {
         match self.context.options.existing_file_action {
             ExistingDriveFileAction::Skip => {
                 println!(
-                    "{}: exists in Google Drive, skipped. Use --replace or --sync to replace",
+                    "{}: exists in Google Drive, skipped. Use --overwrite or --sync to replace",
                     self.item.path.display()
                 );
                 return Ok(());
             }
             ExistingDriveFileAction::Sync | ExistingDriveFileAction::Replace => {
                 return self.handle_existing_items().await;
-            }
-            ExistingDriveFileAction::UploadAnyway => {
-                return self.do_upload_file().await;
             }
         }
     }
