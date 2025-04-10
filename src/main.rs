@@ -396,8 +396,8 @@ enum FileCommand {
         file_path: PathBuf,
 
         /// Upload to an existing directory
-        #[arg(long, value_name = "DIRECTORY_ID")]
-        parent: Option<Vec<String>>,
+        #[arg(long, value_name = "DRIVE FOLDER")]
+        parent: String,
 
         /// Print only id of file
         #[arg(long, default_value_t = false)]
@@ -757,7 +757,7 @@ async fn main() -> Result<()> {
                     // fmt
                     files::import(files::import::Config {
                         file_path,
-                        parents: parent,
+                        parent,
                         print_only_id,
                     })
                     .await?

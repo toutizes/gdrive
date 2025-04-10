@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub file_path: PathBuf,
-    pub parents: Option<Vec<String>>,
+    pub parent: String,
     pub print_only_id: bool,
 }
 
@@ -16,14 +16,13 @@ pub async fn import(config: Config) -> Result<()> {
     let hub = hub_helper::get_hub().await?;
     let delegate_config = UploadDelegateConfig::default();
 
-    let disk_item = DiskItem::for_path(&config.file_path);
+    let disk_item = DiskItem::for_path(Some(config.file_path.clone()));
 
-    let parents = match config.parents {
-        Some(parents) => parents,
-        None => vec![],
-    };
+    let parent_item = DriveItem::for_name(&hub, &config.parent).await?;
 
-    let drive_item = DriveItem::upload(&hub, &disk_item, &None, parents, delegate_config).await?;
+    let drive_item = parent_item
+        .upload(&hub, &disk_item, &None, delegate_config)
+        .await?;
 
     print!("{}: imported {}", config.file_path.display(), drive_item.id);
     Ok(())

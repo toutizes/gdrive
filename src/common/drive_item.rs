@@ -1,16 +1,17 @@
 use crate::common::delegate::{UploadDelegate, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_file;
-use crate::common::file_info::FileInfo;
+use crate::common::drive_names;
 use crate::files;
+use crate::files::mkdir;
 use crate::hub::Hub;
 use anyhow::{anyhow, Result};
-use futures::stream::StreamExt; // for `next()`
 use mime::Mime;
-use std::io::Write; // for `write_all()`
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub enum DriveItemDetails {
+    Root {},
     Directory {},
     File {
         md5: String,
@@ -25,19 +26,36 @@ pub enum DriveItemDetails {
 
 #[derive(Debug, Clone)]
 pub struct DriveItem {
-    pub id: String,
-    pub name: String,
+    pub id: String,   // Empty id for Root
+    pub name: String, // Empty name for Root
     pub parent: Option<String>,
     pub details: DriveItemDetails,
 }
 
 impl DriveItem {
-    pub async fn from_drive_id(hub: &Hub, drive_id: &String) -> Result<DriveItem> {
-        let file = files::info::get_file(&hub, &drive_id).await?;
-        DriveItem::from_drive_file(&file)
+    pub async fn for_name(hub: &Hub, name: &String) -> Result<DriveItem> {
+        match drive_names::resolve(&hub, name).await? {
+            Some(resolved_id) => {
+                DriveItem::for_drive_id(hub, &resolved_id).await
+            }
+            None => {
+                // A None resolved_id means "root"
+                Ok(DriveItem {
+                    id: name.clone(),
+                    name: name.clone(),
+                    parent: None,
+                    details: DriveItemDetails::Root {},
+                })
+            }
+        }
     }
 
-    pub fn from_drive_file(file: &google_drive3::api::File) -> Result<DriveItem> {
+    pub async fn for_drive_id(hub: &Hub, drive_id: &String) -> Result<DriveItem> {
+        let file = files::info::get_file(&hub, &drive_id).await?;
+        DriveItem::for_drive_file(&file)
+    }
+
+    fn for_drive_file(file: &google_drive3::api::File) -> Result<DriveItem> {
         let details: DriveItemDetails;
         if drive_file::is_directory(file) {
             details = DriveItemDetails::Directory {};
@@ -65,15 +83,14 @@ impl DriveItem {
         });
     }
 
-    pub async fn list_drive_dir(hub: &Hub, parent_id: &Option<String>) -> Result<Vec<DriveItem>> {
-        let query: files::list::ListQuery;
-        if let Some(ref id) = parent_id {
-            query = files::list::ListQuery::FilesInFolder {
-                folder_id: id.clone(),
-            };
-        } else {
-            query = files::list::ListQuery::RootNotTrashed;
-        }
+    pub async fn list(&self, hub: &Hub) -> Result<Vec<DriveItem>> {
+        let query: files::list::ListQuery = match &self.details {
+            DriveItemDetails::Directory {} => Ok(files::list::ListQuery::FilesInFolder {
+                folder_id: self.id.clone(),
+            }),
+            DriveItemDetails::Root {} => Ok(files::list::ListQuery::RootNotTrashed),
+            _ => Err(anyhow!("{}: not a file on Google Drive", self.name)),
+        }?;
         let files = files::list::list_files(
             hub,
             &files::list::ListFilesConfig {
@@ -87,7 +104,7 @@ impl DriveItem {
         let mut drive_items = Vec::new();
 
         for file in &files {
-            let item_or = DriveItem::from_drive_file(&file);
+            let item_or = DriveItem::for_drive_file(&file);
             match item_or {
                 Ok(item) => {
                     drive_items.push(item);
@@ -101,14 +118,10 @@ impl DriveItem {
         Ok(drive_items)
     }
 
-    pub async fn from_disk_item(
-        hub: &Hub,
-        disk_item: &DiskItem,
-        parent_id: &Option<String>,
-    ) -> Result<Vec<DriveItem>> {
+    pub async fn list_disk_item(&self, hub: &Hub, disk_item: &DiskItem) -> Result<Vec<DriveItem>> {
         let name = disk_item.require_name()?;
         let mut named_items = Vec::new();
-        let items = DriveItem::list_drive_dir(hub, parent_id).await?;
+        let items = self.list(hub).await?;
         for item in items {
             if &item.name == name {
                 named_items.push(item);
@@ -128,10 +141,10 @@ impl DriveItem {
     }
 
     pub async fn upload(
+        &self,
         hub: &Hub,
         disk_item: &DiskItem,
         force_mime_type: &Option<Mime>,
-        parent_id: Vec<String>,
         delegate_config: UploadDelegateConfig,
     ) -> Result<DriveItem> {
         let name = disk_item.require_name()?;
@@ -142,16 +155,19 @@ impl DriveItem {
         } else {
             mime::APPLICATION_OCTET_STREAM
         };
-        let mut dst_file = google_drive3::api::File {
+
+        let parents: Option<Vec<String>> = match &self.details {
+            DriveItemDetails::Directory {} => Ok(Some(vec![self.id.clone()])),
+            DriveItemDetails::Root {} => Ok(None),
+            _ => Err(anyhow!("{}: not a folder on Google Drive", self.name)),
+        }?;
+
+        let dst_file = google_drive3::api::File {
             name: Some(name.clone()),
             mime_type: Some(mime_type.to_string()),
+            parents,
             ..google_drive3::api::File::default()
         };
-
-        // Do not put parent to upload at the root of the drive.
-        if !parent_id.is_empty() {
-            dst_file.parents = Some(parent_id.clone());
-        }
 
         let mut delegate = UploadDelegate::new(delegate_config);
 
@@ -164,10 +180,10 @@ impl DriveItem {
             .supports_all_drives(true);
 
         let (_, file) = req.upload_resumable(disk_item.reader()?, mime_type).await?;
-        DriveItem::from_drive_file(&file)
+        DriveItem::for_drive_file(&file)
     }
 
-    pub async fn download(&self, hub: &Hub, disk_item: Option<&DiskItem>) -> Result<usize> {
+    pub async fn download(&self, hub: &Hub, disk_item: &DiskItem) -> Result<usize> {
         match &self.details {
             DriveItemDetails::File { md5, .. } => {
                 let (response, _) = hub
@@ -178,25 +194,11 @@ impl DriveItem {
                     .add_scope(google_drive3::api::Scope::Full)
                     .doit()
                     .await?;
-
-                let mut body = response.into_body();
-                match &disk_item {
-                    Some(item) => item.overwrite(body, Some(md5.clone())).await,
-                    None => {
-                        let mut stdout = std::io::stdout();
-                        let mut written_bytes: usize = 0;
-                        while let Some(chunk_result) = body.next().await {
-                            let chunk = chunk_result?;
-                            stdout.write_all(&chunk)?;
-                            written_bytes += chunk.len();
-                        }
-                        Ok(written_bytes)
-                    }
-                }
+                disk_item
+                    .overwrite(response.into_body(), Some(md5.clone()))
+                    .await
             }
-            DriveItemDetails::Directory {} | DriveItemDetails::Shortcut { .. } => {
-                Err(anyhow!("{}: not a file on Google Drive", self.name))
-            }
+            _ => Err(anyhow!("{}: not a Google Drive file", self.name)),
         }
     }
 
@@ -212,45 +214,44 @@ impl DriveItem {
 
                 disk_item.overwrite(response.into_body(), None).await
             }
-            DriveItemDetails::Directory {} | DriveItemDetails::Shortcut { .. } => {
-                Err(anyhow!("{}: not a file on Google Drive", self.name))
-            }
+            _ => Err(anyhow!("{}: not a file on Google Drive", self.name)),
         }
     }
 
-    pub async fn update<RS>(
+    pub async fn update(
         &self,
         hub: &Hub,
-        src_file: RS,
-        file_id: &String,
-        file_info: FileInfo,
+        disk_item: &DiskItem,
+        force_mime_type: &Option<Mime>,
         delegate_config: UploadDelegateConfig,
-    ) -> Result<google_drive3::api::File>
-    where
-        RS: google_drive3::client::ReadSeek,
-    {
-        let dst_file = google_drive3::api::File {
-            name: Some(file_info.name),
-            ..google_drive3::api::File::default()
-        };
+    ) -> Result<()> {
+        match &self.details {
+            DriveItemDetails::File { mime_type, .. } => {
+                let mime_type = if force_mime_type.is_none() {
+                    Mime::from_str(&mime_type)?
+                } else {
+                    force_mime_type.clone().unwrap()
+                };
 
-        let mut delegate = UploadDelegate::new(delegate_config);
+                let file = google_drive3::api::File {
+                    mime_type: Some(mime_type.to_string()),
+                    ..google_drive3::api::File::default()
+                };
+                let mut delegate = UploadDelegate::new(delegate_config);
 
-        let req = hub
-        .files()
-        .update(dst_file, &file_id)
-        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true);
+                let req = hub.files()
+                    .update(file, &self.id)
+                    .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+                    .add_scope(google_drive3::api::Scope::Full)
+                    .delegate(&mut delegate)
+                    .supports_all_drives(true);
 
-        let (_, file) = if file_info.size > 0 {
-            req.upload_resumable(src_file, file_info.mime_type).await?
-        } else {
-            req.upload(src_file, file_info.mime_type).await?
-        };
+                req.upload_resumable(disk_item.reader()?, mime_type).await?;
 
-        Ok(file)
+                Ok(())
+            }
+            _ => Err(anyhow!("{}: not a file on Google Drive", self.name)),
+        }
     }
 
     pub async fn delete(&self, hub: &Hub) -> Result<()> {
@@ -261,6 +262,32 @@ impl DriveItem {
             .doit()
             .await?;
         Ok(())
+    }
+
+    pub async fn mkdir(
+        &self,
+        hub: &Hub,
+        delegate_config: &UploadDelegateConfig,
+        name: &String,
+    ) -> Result<DriveItem> {
+        let parents: Option<Vec<String>> = match &self.details {
+            DriveItemDetails::Directory {} => Ok(Some(vec![self.id.clone()])),
+            DriveItemDetails::Root {} => Ok(None),
+            _ => Err(anyhow!("{}: not a folder on Google Drive", self.name)),
+        }?;
+        DriveItem::for_drive_file(
+            &mkdir::create_directory(
+                hub,
+                &mkdir::Config {
+                    id: None,
+                    name: name.clone(),
+                    parents,
+                    print_only_id: false,
+                },
+                delegate_config.clone(),
+            )
+            .await?,
+        )
     }
 }
 

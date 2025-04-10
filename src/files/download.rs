@@ -1,15 +1,12 @@
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
-use crate::common::drive_names;
 use crate::common::hub_helper;
-use crate::files;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use human_bytes::human_bytes;
 use std::collections::HashSet;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,23 +33,31 @@ pub async fn download(
 ) -> Result<()> {
     let start = Instant::now();
     let hub = Arc::new(hub_helper::get_hub().await?);
-
-    let resolved_id: String = drive_names::resolve(&hub, drive_path)
-        .await?
-        .ok_or(anyhow!("{}: cannot download that path", drive_path))?;
-    let file = files::info::get_file(&hub, &resolved_id).await?;
-    let drive_item = DriveItem::from_drive_file(&file)?;
-
     let tm = Arc::new(TaskManager::new(workers));
+
     let context = DownloadContext {
         hub: hub.clone(),
         tm: tm.clone(),
         options: options.clone(),
     };
 
-    tm.add_task(DownloadTask::new(context.clone(), drive_item, destination.clone()));
+    match &destination {
+        Some(path) => {
+            if !path.exists() {
+                return Err(anyhow!("{}: does not exists", path.display()));
+            }
+        }
+        _ => {}
+    }
+
+    let drive_item = DriveItem::for_name(&hub, &drive_path).await?;
+    let disk_item = DiskItem::for_path(destination.clone());
+
+    tm.add_task(DownloadTask::new(context.clone(), drive_item, disk_item));
+
     let tasks = tm.wait().await;
     report_stats(tasks, start.elapsed());
+
     Ok(())
 }
 
@@ -82,8 +87,8 @@ fn report_stats(tasks: Vec<Arc<Box<DownloadTask>>>, duration: Duration) {
 
 pub struct DownloadTask {
     context: DownloadContext,
-    item: DriveItem,
-    filepath: Option<PathBuf>, // If None, download the file to stdout
+    drive_item: DriveItem,
+    disk_item: DiskItem,
     status: Mutex<DriveTaskStatus>,
     stats: Mutex<DownloadStats>,
 }
@@ -115,11 +120,11 @@ impl DownloadStats {
 }
 
 impl DownloadTask {
-    pub fn new(context: DownloadContext, item: DriveItem, filepath: Option<PathBuf>) -> Self {
+    pub fn new(context: DownloadContext, drive_item: DriveItem, disk_item: DiskItem) -> Self {
         Self {
             context,
-            item,
-            filepath,
+            drive_item,
+            disk_item,
             status: Mutex::new(DriveTaskStatus::Pending),
             stats: Mutex::new(DownloadStats {
                 num_files: 0,
@@ -132,7 +137,8 @@ impl DownloadTask {
     }
 
     pub async fn download(&self) -> Result<()> {
-        match &self.item.details {
+        match &self.drive_item.details {
+            DriveItemDetails::Root {} => Err(anyhow!("Not downloading the full Google Drive")),
             DriveItemDetails::Directory {} => self.download_directory().await,
             DriveItemDetails::File { ref md5, .. } => self.download_file(md5).await,
             DriveItemDetails::Shortcut { ref target_id, .. } => {
@@ -145,36 +151,36 @@ impl DownloadTask {
         if !self.context.options.download_directories {
             return Err(anyhow!(
                 "{}: drive file is a directory, use --recursive to download directories",
-                self.item.name,
+                self.drive_item.name,
             ));
         }
 
-        let filepath: &PathBuf = self.filepath.as_ref().unwrap();
-        let num_dirs_created = create_dir_if_needed(filepath)?;
-        let items =
-            DriveItem::list_drive_dir(&self.context.hub, &Some(self.item.id.clone())).await?;
+        let dir_created = self.disk_item.mkdir()?;
 
         // Use to collect the existing drive files if we want to delete
         // the extra local files later.
         let mut keep_names: HashSet<String> = HashSet::new();
+        let items = self.drive_item.list(&self.context.hub).await?;
 
         for item in items {
             keep_names.insert(item.name.clone());
-            let itempath = Some(filepath.join(&item.name));
-            self.context
-                .tm
-                .add_task(DownloadTask::new(self.context.clone(), item, itempath));
+            let item_disk_item = self.disk_item.join(&item.name)?;
+            self.context.tm.add_task(DownloadTask::new(
+                self.context.clone(),
+                item,
+                item_disk_item,
+            ));
         }
 
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
         let mut num_files_deleted: usize = 0;
         if self.context.options.existing_file_action == ExistingFileAction::SyncLocal {
-            num_files_deleted = delete_extra_local_files(filepath, &keep_names)?;
+            num_files_deleted = self.disk_item.delete_extra_local_files(&keep_names)?;
         }
 
         *(self.stats.lock().unwrap()) = DownloadStats {
             num_files: 0,
-            num_directories: num_dirs_created,
+            num_directories: dir_created,
             num_bytes: 0,
             num_deleted_files: num_files_deleted,
             num_errors: 0,
@@ -184,52 +190,51 @@ impl DownloadTask {
     }
 
     async fn download_file(&self, md5: &String) -> Result<()> {
-        let (disk_item, display_str): (Option<DiskItem>, String) = match &self.filepath {
-            Some(filepath) => {
-                let item = DiskItem::for_path(&filepath);
-                if filepath.exists() {
-                    if filepath.is_dir() {
+        match &self.disk_item {
+            DiskItem::FileOrDir { path, .. } => {
+                if path.exists() {
+                    if path.is_dir() {
                         return Err(anyhow!(
                             "{}: this drive file exists as a local directory, not downloaded",
-                            filepath.display()
+                            self.disk_item
                         ));
                     }
                     if self.context.options.existing_file_action == ExistingFileAction::Abort {
-                        return Err(anyhow!("{}: file exists, skipped.", filepath.display()));
+                        println!("{}: file exists, skipped.", self.disk_item);
                     }
-                    if item.matches_md5(md5) {
+                    if self.disk_item.matches_md5(md5) {
                         return Ok(());
                     }
                 }
-                (Some(item), filepath.display().to_string())
             }
-            None => (None, self.item.id.clone()),
+            _ => {}
         };
+
         let start = Instant::now();
-        let file_bytes = self
-            .item
-            .download(&self.context.hub, disk_item.as_ref())
+        let downloaded_bytes = self
+            .drive_item
+            .download(&self.context.hub, &self.disk_item)
             .await?;
         let duration = start.elapsed();
-        println!("{}: {:.2}s", display_str, duration.as_secs_f64());
+        println!("{}: {:.2}s", self.disk_item, duration.as_secs_f64());
+
         *(self.stats.lock().unwrap()) = DownloadStats {
             num_files: 1,
             num_directories: 0,
-            num_bytes: file_bytes,
+            num_bytes: downloaded_bytes,
             num_deleted_files: 0,
             num_errors: 0,
         };
-        *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(file_bytes);
+        *(self.status.lock().unwrap()) = DriveTaskStatus::Completed(downloaded_bytes);
         Ok(())
     }
 
     async fn download_shortcut(&self, target_id: &String) -> Result<()> {
-        let target_file = files::info::get_file(&self.context.hub, target_id).await?;
-        let target_item = DriveItem::from_drive_file(&target_file)?;
+        let target_item = DriveItem::for_drive_id(&self.context.hub, target_id).await?;
         self.context.tm.add_task(DownloadTask::new(
             self.context.clone(),
             target_item,
-            self.filepath.clone(),
+            self.disk_item.clone(),
         ));
         Ok(())
     }
@@ -251,43 +256,4 @@ impl DriveTask for DownloadTask {
             }
         }
     }
-}
-
-fn create_dir_if_needed(path: &PathBuf) -> Result<usize> {
-    // Only create the directory if it doesn't exist
-    if !path.exists() {
-        println!("{}: created directory", path.display());
-        fs::create_dir_all(&path)?;
-        Ok(1)
-    } else {
-        let file_type = fs::metadata(&path)?.file_type();
-        if !file_type.is_dir() {
-            return Err(anyhow!("{}: is not a directory, skipped", path.display()));
-        }
-        Ok(0)
-    }
-}
-
-fn delete_extra_local_files(path: &PathBuf, names_to_keep: &HashSet<String>) -> Result<usize> {
-    let mut n: usize = 0;
-    for entry in fs::read_dir(path)? {
-        let valid_entry = entry?;
-        let entry_name = valid_entry.file_name().to_string_lossy().to_string();
-        if names_to_keep.contains(&entry_name) {
-            continue;
-        }
-        let entry_type = valid_entry.file_type()?;
-        if entry_type.is_file() || entry_type.is_symlink() {
-            let delete_path = &valid_entry.path();
-            fs::remove_file(delete_path)?;
-            println!("{}: deleted", delete_path.display());
-            n += 1;
-        } else {
-            println!(
-                "{}: not deleting (not a file or symlink)",
-                path.join(entry_name).display(),
-            );
-        }
-    }
-    Ok(n)
 }

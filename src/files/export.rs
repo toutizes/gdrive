@@ -32,7 +32,7 @@ pub async fn export(config: Config) -> Result<()> {
         ))?;
     }
 
-    let drive_item = DriveItem::from_drive_id(&hub, &config.file_id).await?;
+    let drive_item = DriveItem::for_drive_id(&hub, &config.file_id).await?;
 
     match &drive_item.details {
         DriveItemDetails::File { mime_type, .. } => {
@@ -54,10 +54,12 @@ pub async fn export(config: Config) -> Result<()> {
                     doc_type
                 ));
             };
-            let disk_item = DiskItem::for_path(&config.file_path);
+            let disk_item = DiskItem::for_path(Some(config.file_path.clone()));
             drive_item.export(&hub, &disk_item).await?;
         }
-        DriveItemDetails::Directory {} | DriveItemDetails::Shortcut { .. } => {
+        DriveItemDetails::Root {}
+        | DriveItemDetails::Directory {}
+        | DriveItemDetails::Shortcut { .. } => {
             Err(anyhow!("{}: not a file on Google Drive", drive_item.id))?;
         }
     };

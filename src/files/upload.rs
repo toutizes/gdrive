@@ -1,10 +1,7 @@
 use crate::common::delegate::{BackoffConfig, ChunkSize, UploadDelegateConfig};
 use crate::common::disk_item::DiskItem;
 use crate::common::drive_item::{DriveItem, DriveItemDetails};
-use crate::common::drive_names;
-use crate::common::file_info::FileInfo;
 use crate::common::hub_helper;
-use crate::files::mkdir;
 use crate::files::tasks::{DriveTask, DriveTaskStatus, TaskManager};
 use crate::hub::Hub;
 use anyhow::{anyhow, Result};
@@ -13,7 +10,6 @@ use clap::ValueEnum;
 use mime::Mime;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,16 +51,10 @@ pub async fn upload(
     };
 
     let tm = Arc::new(TaskManager::new(workers));
-    let disk_item = DiskItem::for_path(&file_path);
+    let disk_item = DiskItem::for_path(Some(file_path.clone()));
 
-    let resolved_id = drive_names::resolve(&hub, destination).await?;
-    let existing_items = DriveItem::from_disk_item(&hub, &disk_item, &resolved_id).await?;
-
-    let parents: Vec<String> = if let Some(parent_id) = resolved_id {
-        vec![parent_id.clone()]
-    } else {
-        vec![]
-    };
+    let dest = DriveItem::for_name(&hub, destination).await?;
+    let existing_items = dest.list_disk_item(&hub, &disk_item).await?;
 
     let task = UploadTask::new(
         UploadContext {
@@ -74,7 +64,7 @@ pub async fn upload(
             options: options.clone(),
         },
         disk_item,
-        parents,
+        dest,
         existing_items,
     );
 
@@ -95,9 +85,9 @@ pub struct UploadContext {
 pub struct UploadTask {
     context: UploadContext,
     item: DiskItem,
-    // Parent where to upload. TODO: make it an Option<DriveItem> with None => root.
-    parent_id: Vec<String>,
-    // List of items with the name item.name in the parent_id folder.
+    // Parent drive object where to upload the item
+    dest_parent: DriveItem,
+    // List of items with the name item.name in the parent
     existing_items: Vec<DriveItem>,
     status: Mutex<DriveTaskStatus>,
     // stats: Mutex<UploadStats>,
@@ -116,13 +106,13 @@ impl UploadTask {
     pub fn new(
         context: UploadContext,
         item: DiskItem,
-        parent_id: Vec<String>,
+        dest_parent: DriveItem,
         existing_items: Vec<DriveItem>,
     ) -> Self {
         Self {
             context,
             item,
-            parent_id,
+            dest_parent,
             existing_items,
             status: Mutex::new(DriveTaskStatus::Pending),
             // stats: Mutex::new(UploadStats {
@@ -136,15 +126,12 @@ impl UploadTask {
     }
 
     async fn upload(&self) -> Result<()> {
-        if self.item.path.is_dir() {
+        if self.item.is_dir() {
             self.maybe_upload_directory().await
-        } else if self.item.path.is_file() {
+        } else if self.item.is_file() {
             self.maybe_upload_file().await
         } else {
-            Err(anyhow!(
-                "{}: not a file or directory, skipped",
-                self.item.path.display()
-            ))
+            Err(anyhow!("{}: not a file or directory, skipped", self.item))
         }
     }
 
@@ -154,30 +141,21 @@ impl UploadTask {
         if !self.context.options.upload_directories {
             return Err(anyhow!(
                 "{}: is a directory. Use --recursive to upload",
-                self.item.path.display()
+                self.item
             ));
         } else if self.existing_items.is_empty() {
             // Directory does not exist on drive, create it, then continue uploading.
             let name = self.item.require_name()?;
-            let drive_folder = mkdir::create_directory(
-                &self.context.hub,
-                &mkdir::Config {
-                    id: None,
-                    name: name.clone(),
-                    parents: Some(self.parent_id.clone()),
-                    print_only_id: false,
-                },
-                self.context.delegate_config.clone(),
-            )
-            .await?;
-            return self
-                .do_upload_directory(DriveItem::from_drive_file(&drive_folder)?, vec![])
-                .await;
+            let drive_folder = self
+                .dest_parent
+                .mkdir(&self.context.hub, &self.context.delegate_config, &name)
+                .await?;
+            return self.do_upload_directory(drive_folder, vec![]).await;
         } else if self.existing_items.len() > 1 {
             // More than one item with the same exist on drive, abort.
             return Err(anyhow!(
                 "{}: multiple drive entries with exist with that name",
-                self.item.path.display()
+                self.item
             ));
         } else {
             // Exactly one item with the same exist on drive, continue if it is a directory.
@@ -186,15 +164,11 @@ impl UploadTask {
                 DriveItemDetails::File { .. } | DriveItemDetails::Shortcut { .. } => {
                     return Err(anyhow!(
                         "{}: exists in Google Drive but is not a directory, skipping",
-                        self.item.path.display()
+                        self.item
                     ));
                 }
-                DriveItemDetails::Directory { .. } => {
-                    let drive_items = DriveItem::list_drive_dir(
-                        &self.context.hub,
-                        &Some(existing_item.id.clone()),
-                    )
-                    .await?;
+                DriveItemDetails::Directory { .. } | DriveItemDetails::Root {} => {
+                    let drive_items = existing_item.list(&self.context.hub).await?;
                     return self.do_upload_directory(existing_item, drive_items).await;
                 }
             }
@@ -211,6 +185,8 @@ impl UploadTask {
     ) -> Result<()> {
         // List all the existing drive items.
         let mut drive_item_map: HashMap<String, Vec<DriveItem>> = HashMap::new();
+
+
         for drive_item in &drive_items {
             let name = drive_item.name.clone();
             if let Some(in_map_items) = drive_item_map.get_mut(&name) {
@@ -222,15 +198,14 @@ impl UploadTask {
 
         // Iterate over all the local items, creating upload tasks.
         let mut disk_item_set: HashSet<String> = HashSet::new();
-        let disk_items = self.item.list_dir()?;
-        for disk_item in disk_items {
+        for disk_item in self.item.list_dir()? {
             let disk_name = disk_item.require_name()?;
             disk_item_set.insert(disk_name.clone());
             let drive_items = drive_item_map.get(disk_name).cloned().unwrap_or_default();
             let task = UploadTask::new(
                 self.context.clone(),
                 disk_item,
-                vec![drive_dir.id.clone()],
+                drive_dir.clone(),
                 drive_items,
             );
             self.context.tm.add_task(task);
@@ -253,22 +228,22 @@ impl UploadTask {
     // Do some checks before uploading a file.
     async fn maybe_upload_file(&self) -> Result<()> {
         if self.existing_items.is_empty() {
-            println!("{}: uploading to Google Drive", self.item.path.display());
-            DriveItem::upload(
-                &self.context.hub,
-                &self.item,
-                &self.context.options.force_mime_type,
-                self.parent_id.clone(),
-                self.context.delegate_config.clone(),
-            )
-            .await?;
+            println!("{}: uploading to Google Drive", self.item);
+            self.dest_parent
+                .upload(
+                    &self.context.hub,
+                    &self.item,
+                    &self.context.options.force_mime_type,
+                    self.context.delegate_config.clone(),
+                )
+                .await?;
             return Ok(());
         }
         match self.context.options.existing_file_action {
             ExistingDriveFileAction::Skip => {
                 println!(
                     "{}: exists in Google Drive, skipped. Use --overwrite or --sync to replace",
-                    self.item.path.display()
+                    self.item
                 );
                 Ok(())
             }
@@ -276,39 +251,34 @@ impl UploadTask {
                 if self.existing_items.len() > 1 {
                     println!(
                         "{}: {} items with the same name on Google Drive, skipped",
-                        self.item.path.display(),
+                        self.item,
                         self.existing_items.len()
                     );
                     return Ok(());
                 }
                 let existing_item = &self.existing_items[0];
                 match &existing_item.details {
+                    DriveItemDetails::Root { .. } => {
+                        println!("{}: is a Google Drive root, skipped", self.item);
+                        Ok(())
+                    }
                     DriveItemDetails::Directory { .. } => {
-                        println!(
-                            "{}: is a folder on Google Drive, skipped",
-                            self.item.path.display()
-                        );
+                        println!("{}: is a folder on Google Drive, skipped", self.item);
                         Ok(())
                     }
                     DriveItemDetails::Shortcut { .. } => {
-                        println!(
-                            "{}: is a shortcut on Google Drive, skipped",
-                            self.item.path.display()
-                        );
+                        println!("{}: is a shortcut on Google Drive, skipped", self.item);
                         Ok(())
                     }
                     DriveItemDetails::File { md5, .. } => {
                         if self.item.matches_md5(&md5) {
                             println!(
                                 "{}: file already exists and is identical on Google Drive, skipped",
-                                self.item.path.display()
+                                self.item
                             );
                             return Ok(());
                         }
-                        println!(
-                            "{}: updating existing Google Drive file",
-                            self.item.path.display()
-                        );
+                        println!("{}: updating existing Google Drive file", self.item);
                         self.do_update_file(existing_item).await
                     }
                 }
@@ -318,37 +288,22 @@ impl UploadTask {
 
     async fn do_update_file(&self, drive_item: &DriveItem) -> Result<()> {
         match &drive_item.details {
-            DriveItemDetails::File {
-                mime_type, size, ..
-            } => {
-                let mime_type_mime = Mime::from_str(&mime_type)?;
-                let file_info = FileInfo {
-                    name: drive_item.name.clone(),
-                    mime_type: mime_type_mime,
-                    parents: Some(self.parent_id.clone()),
-                    size: *size as u64,
-                };
-
-                let file = std::fs::File::open(&self.item.path)?;
-
-                let reader = std::io::BufReader::new(file);
-
-                let _drive_file = &drive_item
+            DriveItemDetails::File { .. } => {
+                _ = &drive_item
                     .update(
                         &self.context.hub,
-                        reader,
-                        &drive_item.id,
-                        file_info,
+                        &self.item,
+                        &None,
                         self.context.delegate_config.clone(),
                     )
                     .await?;
 
                 Ok(())
             }
-            DriveItemDetails::Directory { .. } | DriveItemDetails::Shortcut { .. } => {
+            _ => {
                 return Err(anyhow!(
                     "{}: existing drive items is not a file, skipped",
-                    self.item.path.display()
+                    self.item
                 ));
             }
         }
