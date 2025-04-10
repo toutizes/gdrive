@@ -7,7 +7,6 @@ pub mod drive_names;
 pub mod empty_file;
 pub mod file_info;
 pub mod hub_helper;
-pub mod id_gen;
 pub mod md5_writer;
 pub mod permission;
 pub mod table;
