@@ -17,6 +17,7 @@ use files::list::ListSortOrder;
 use mime::Mime;
 use std::error::Error;
 use std::path::PathBuf;
+use tokio::runtime::Builder;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, disable_version_flag = true)]
@@ -30,7 +31,7 @@ struct Cli {
 
     /// Number of workers to use for parallelising operations
     #[arg(long, default_value = "1")]
-    workers: Option<usize>,
+    workers: usize,
 }
 
 #[derive(Subcommand)]
@@ -475,10 +476,21 @@ enum PermissionCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// #[tokio::main]
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let rt = Builder::new_multi_thread()
+        .worker_threads(cli.workers)
+        .enable_all()
+        .build()?;
+
+    return rt.block_on(async {
+        do_it(cli).await
+    });
+}
+
+async fn do_it(cli: Cli) -> Result<()> {
     match cli.command {
         Command::About => {
             // fmt
@@ -629,7 +641,7 @@ async fn main() -> Result<()> {
                         follow_shortcuts,
                         download_directories: recursive,
                     };
-                    files::download(&drive_path, &dst, &options, cli.workers.unwrap()).await?
+                    files::download(&drive_path, &dst, &options, 2 * cli.workers).await?
                 }
 
                 FileCommand::Upload {
@@ -670,7 +682,7 @@ async fn main() -> Result<()> {
                         print_chunk_errors,
                         print_chunk_info,
                         print_only_id,
-                        cli.workers.unwrap(),
+                        2 * cli.workers,
                     )
                     .await?
                 }
