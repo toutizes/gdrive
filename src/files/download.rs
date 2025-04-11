@@ -41,17 +41,19 @@ pub async fn download(
         options: options.clone(),
     };
 
-    match &destination {
+    let drive_item = DriveItem::for_name(&hub, &drive_path).await?;
+
+    let disk_item = match &destination {
         Some(path) => {
             if !path.exists() {
                 return Err(anyhow!("{}: does not exists", path.display()));
             }
+            let mut item_path = path.clone();
+            item_path.push(drive_item.name.clone());
+            DiskItem::for_path(Some(item_path))
         }
-        _ => {}
-    }
-
-    let drive_item = DriveItem::for_name(&hub, &drive_path).await?;
-    let disk_item = DiskItem::for_path(destination.clone());
+        _ => DiskItem::for_path(None)
+    };
 
     tm.add_task(DownloadTask::new(context.clone(), drive_item, disk_item));
 

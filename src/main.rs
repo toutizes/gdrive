@@ -167,8 +167,9 @@ enum FileCommand {
     /// Download a file or a folder from Google Drive to the local
     /// disk.
     ///
-    /// If you do not pass --destination <LOCAL FOLDER> the files is
-    /// downloaded to the current directory. See also --stdout.
+    /// If you do not pass --destination <LOCAL FOLDER> the file or
+    /// folder is downloaded to the current directory. See also
+    /// --stdout.
     ///
     /// To download a Google Drive folder you must pass --recursive.
     ///
@@ -176,8 +177,8 @@ enum FileCommand {
     /// present on the local disk. See --overwrite and --sync for
     /// other options.
     ///
-    /// When downloading a folder, it is an error if a folder contains
-    /// multiple files with the same name.
+    /// It is an error if a folder contains multiple files with the
+    /// same name.
     ///
     /// By default Google Drive shortcuts are ignored. See
     /// --follow-shortcuts to follow them.
@@ -189,9 +190,7 @@ enum FileCommand {
         /// /<folder name>/<folder name>.
         ///
         /// If the name does not start with a / it must be a Google
-        /// Drive item id, as returned by "gdrive list". You can use
-        /// that to unambiguously download one of multiple files with
-        /// the same name from a Google Drive folder.
+        /// Drive item id, as returned by "gdrive list".
         #[arg(value_name = "DRIVE FILE OR FOLDER", required = true)]
         drive_path: String,
 
@@ -633,7 +632,7 @@ async fn do_it(cli: Cli) -> Result<()> {
                         }
                         dst = None;
                     } else {
-                        dst = destination;
+                        dst = Some(destination.unwrap_or(PathBuf::from(".")));
                     }
 
                     let options = files::download::DownloadOptions {
