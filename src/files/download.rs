@@ -16,6 +16,7 @@ pub struct DownloadOptions {
     pub existing_file_action: ExistingFileAction,
     pub follow_shortcuts: bool,
     pub download_directories: bool,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -52,7 +53,7 @@ pub async fn download(
             item_path.push(drive_item.name.clone());
             DiskItem::for_path(Some(item_path))
         }
-        _ => DiskItem::for_path(None)
+        _ => DiskItem::for_path(None),
     };
 
     tm.add_task(DownloadTask::new(context.clone(), drive_item, disk_item));
@@ -157,7 +158,7 @@ impl DownloadTask {
             ));
         }
 
-        let dir_created = self.disk_item.mkdir()?;
+        let dir_created = self.disk_item.mkdir(self.context.options.dry_run)?;
 
         // Use to collect the existing drive files if we want to delete
         // the extra local files later.
@@ -177,7 +178,9 @@ impl DownloadTask {
         // NOTE: This runs after we launched the tasks to dowload the directory contents.
         let mut num_files_deleted: usize = 0;
         if self.context.options.existing_file_action == ExistingFileAction::SyncLocal {
-            num_files_deleted = self.disk_item.delete_extra_local_files(&keep_names)?;
+            num_files_deleted = self
+                .disk_item
+                .delete_extra_local_files(&keep_names, self.context.options.dry_run)?;
         }
 
         *(self.stats.lock().unwrap()) = DownloadStats {
@@ -212,13 +215,14 @@ impl DownloadTask {
             _ => {}
         };
 
-        let start = Instant::now();
         let downloaded_bytes = self
             .drive_item
-            .download(&self.context.hub, &self.disk_item)
+            .download(
+                &self.context.hub,
+                &self.disk_item,
+                self.context.options.dry_run,
+            )
             .await?;
-        let duration = start.elapsed();
-        println!("{}: {:.2}s", self.disk_item, duration.as_secs_f64());
 
         *(self.stats.lock().unwrap()) = DownloadStats {
             num_files: 1,

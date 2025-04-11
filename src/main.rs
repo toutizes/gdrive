@@ -26,8 +26,8 @@ struct Cli {
     command: Command,
 
     /// Only list what would be done.
-    #[arg(long, default_value = "false")]
-    pretend: Option<bool>,
+    #[arg(long, short='n', default_value = "false")]
+    dry_run: bool,
 
     /// Number of workers to use for parallelising operations
     #[arg(long, default_value = "1")]
@@ -639,6 +639,7 @@ async fn do_it(cli: Cli) -> Result<()> {
                         existing_file_action,
                         follow_shortcuts,
                         download_directories: recursive,
+                        dry_run: cli.dry_run,
                     };
                     files::download(&drive_path, &dst, &options, 2 * cli.workers).await?
                 }

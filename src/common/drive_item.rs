@@ -8,6 +8,7 @@ use crate::hub::Hub;
 use anyhow::{anyhow, Result};
 use mime::Mime;
 use std::str::FromStr;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub enum DriveItemDetails {
@@ -183,23 +184,32 @@ impl DriveItem {
         DriveItem::for_drive_file(&file)
     }
 
-    pub async fn download(&self, hub: &Hub, disk_item: &DiskItem) -> Result<usize> {
+    pub async fn download(&self, hub: &Hub, disk_item: &DiskItem, dry_run: bool) -> Result<usize> {
         match &self.details {
-            DriveItemDetails::File { md5, .. } => {
-                let (response, _) = hub
-                    .files()
-                    .get(&self.id)
-                    .supports_all_drives(true)
-                    .param("alt", "media")
-                    .add_scope(google_drive3::api::Scope::Full)
-                    .doit()
-                    .await?;
-                disk_item
-                    .overwrite(response.into_body(), Some(md5.clone()))
-                    .await
+            DriveItemDetails::File { md5, size, .. } => {
+                if !dry_run {
+                    let start = Instant::now();
+                    let (response, _) = hub
+                        .files()
+                        .get(&self.id)
+                        .supports_all_drives(true)
+                        .param("alt", "media")
+                        .add_scope(google_drive3::api::Scope::Full)
+                        .doit()
+                        .await?;
+                    let bytes = disk_item
+                        .overwrite(response.into_body(), Some(md5.clone()))
+                        .await?;
+                    let duration = start.elapsed();
+                    println!("{}: {:.2}s", disk_item, duration.as_secs_f64());
+                    Ok(bytes)
+                } else {
+                    println!("{}: would download", disk_item);
+                    Ok(*size as usize)
+                }
             }
             _ => Err(anyhow!("{}: not a Google Drive file", self.name)),
-        }
+        } 
     }
 
     pub async fn export(&self, hub: &Hub, disk_item: &DiskItem) -> Result<usize> {

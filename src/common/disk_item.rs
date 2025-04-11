@@ -41,19 +41,15 @@ impl DiskItem {
 
     pub fn is_dir(&self) -> bool {
         match self {
-            DiskItem::FileOrDir { path, .. } | DiskItem::Root { path } => 
-                path.is_dir(),
-            DiskItem::Stdout { .. } => 
-                false,
+            DiskItem::FileOrDir { path, .. } | DiskItem::Root { path } => path.is_dir(),
+            DiskItem::Stdout { .. } => false,
         }
     }
 
     pub fn is_file(&self) -> bool {
         match self {
-            DiskItem::FileOrDir { path, .. } | DiskItem::Root { path } => 
-                path.is_file(),
-            DiskItem::Stdout { .. } => 
-                false,
+            DiskItem::FileOrDir { path, .. } | DiskItem::Root { path } => path.is_file(),
+            DiskItem::Stdout { .. } => false,
         }
     }
 
@@ -93,12 +89,16 @@ impl DiskItem {
         }
     }
 
-    pub fn mkdir(&self) -> Result<usize> {
+    pub fn mkdir(&self, dry_run: bool) -> Result<usize> {
         match self {
             DiskItem::FileOrDir { path, .. } => {
                 if !path.exists() {
-                    fs::create_dir_all(&path)?;
-                    println!("{}: created directory", self);
+                    if !dry_run {
+                        fs::create_dir_all(&path)?;
+                        println!("{}: created directory", self);
+                    } else {
+                        println!("{}: would create directory", self);
+                    }
                     Ok(1)
                 } else {
                     let file_type = fs::metadata(&path)?.file_type();
@@ -112,7 +112,11 @@ impl DiskItem {
         }
     }
 
-    pub fn delete_extra_local_files(&self, names_to_keep: &HashSet<String>) -> Result<usize> {
+    pub fn delete_extra_local_files(
+        &self,
+        names_to_keep: &HashSet<String>,
+        dry_run: bool,
+    ) -> Result<usize> {
         match self {
             DiskItem::FileOrDir { path, .. } | DiskItem::Root { path } => {
                 let mut n: usize = 0;
@@ -125,8 +129,12 @@ impl DiskItem {
                     let entry_type = valid_entry.file_type()?;
                     if entry_type.is_file() || entry_type.is_symlink() {
                         let delete_path = &valid_entry.path();
-                        fs::remove_file(delete_path)?;
-                        println!("{}: deleted", delete_path.display());
+                        if !dry_run {
+                            fs::remove_file(delete_path)?;
+                            println!("{}: deleted", delete_path.display());
+                        } else {
+                            println!("{}: would delete", delete_path.display());
+                        }
                         n += 1;
                     } else {
                         println!(
