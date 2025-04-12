@@ -8,6 +8,7 @@ use crate::hub::Hub;
 use anyhow::{anyhow, Result};
 use mime::Mime;
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -28,6 +29,7 @@ pub enum DriveItemDetails {
 
 #[derive(Debug, Clone)]
 pub struct DriveItem {
+    pub path: PathBuf,      // Manufactured path.
     pub name: String,       // Empty name for Root
     id: String,             // Empty id for Root or not created dir
     parent: Option<String>, // Not really used yet.
@@ -35,14 +37,16 @@ pub struct DriveItem {
 }
 
 impl DriveItem {
-    pub async fn for_name(hub: &Hub, name: &String) -> Result<DriveItem> {
-        match drive_names::resolve(&hub, name).await? {
-            Some(resolved_id) => DriveItem::for_drive_id(hub, &resolved_id).await,
+    pub async fn for_name(hub: &Hub, drive_name: &String) -> Result<DriveItem> {
+        let drive_path = PathBuf::from(drive_name);
+        match drive_names::resolve(&hub, drive_name).await? {
+            Some(resolved_id) => DriveItem::for_drive_id(hub, &drive_path, &resolved_id).await,
             None => {
                 // A None resolved_id means "root"
                 Ok(DriveItem {
-                    id: name.clone(),
-                    name: name.clone(),
+                    id: "<root>".to_string(),
+                    name: "".to_string(),
+                    path: drive_path.clone(),
                     parent: None,
                     details: DriveItemDetails::Root {},
                 })
@@ -50,24 +54,30 @@ impl DriveItem {
         }
     }
 
-    pub async fn for_drive_id(hub: &Hub, drive_id: &String) -> Result<DriveItem> {
+    pub async fn for_drive_id(
+        hub: &Hub,
+        drive_path: &PathBuf,
+        drive_id: &String,
+    ) -> Result<DriveItem> {
         let file = files::info::get_file(&hub, &drive_id).await?;
-        DriveItem::for_drive_file(&file)
+        DriveItem::for_drive_file(&file, drive_path)
     }
 
-    fn for_future_dir(name: String, parent: String) -> DriveItem {
+    fn for_future_dir(name: String, parent: String, path: &PathBuf) -> DriveItem {
         DriveItem {
             id: "".to_string(),
             name,
+            path: path.clone(),
             parent: Some(parent),
             details: DriveItemDetails::Directory {},
         }
     }
 
-    fn for_future_file(name: String, parent: String) -> DriveItem {
+    fn for_future_file(name: String, parent: String, path: &PathBuf) -> DriveItem {
         DriveItem {
             id: "".to_string(),
             name,
+            path: path.clone(),
             parent: Some(parent),
             details: DriveItemDetails::File {
                 md5: "".to_string(),
@@ -77,7 +87,7 @@ impl DriveItem {
         }
     }
 
-    fn for_drive_file(file: &google_drive3::api::File) -> Result<DriveItem> {
+    fn for_drive_file(file: &google_drive3::api::File, drive_path: &PathBuf) -> Result<DriveItem> {
         let details: DriveItemDetails;
         if drive_file::is_directory(file) {
             details = DriveItemDetails::Directory {};
@@ -100,6 +110,7 @@ impl DriveItem {
         return Ok(DriveItem {
             id: get_file_id(&file)?,
             name: get_file_name(&file)?,
+            path: drive_path.clone(),
             parent: get_file_parent(&file)?,
             details,
         });
@@ -126,13 +137,15 @@ impl DriveItem {
         let mut drive_items = Vec::new();
 
         for file in &files {
-            let item_or = DriveItem::for_drive_file(&file);
+            let name = get_file_name(&file)?;
+            let path = self.path.join(&name);
+            let item_or = DriveItem::for_drive_file(&file, &path);
             match item_or {
                 Ok(item) => {
                     drive_items.push(item);
                 }
                 Err(err) => {
-                    println!("Ignoring drive item: {:?}", err);
+                    println!("{}: ignored. {}", path.display(), err);
                 }
             }
         }
@@ -205,11 +218,19 @@ impl DriveItem {
             .supports_all_drives(true);
 
             let (_, file) = req.upload_resumable(disk_item.reader()?, mime_type).await?;
-            println!("{}: {:.2}s", disk_item, start.elapsed().as_secs_f64());
-            DriveItem::for_drive_file(&file)
+            let uploaded_drive_item = DriveItem::for_drive_file(&file, &self.path.join(&name))?;
+            println!(
+                "{}: upload to {}: {:.2}s",
+                disk_item,
+                &uploaded_drive_item,
+                start.elapsed().as_secs_f64()
+            );
+            Ok(uploaded_drive_item)
         } else {
-            println!("{}: would upload", disk_item);
-            Ok(DriveItem::for_future_file(name.clone(), self.id.clone()))
+            let fake_uploaded_drive_item =
+                DriveItem::for_future_file(name.clone(), self.id.clone(), &self.path.join(name));
+            println!("{}: upload to {}", disk_item, fake_uploaded_drive_item);
+            Ok(fake_uploaded_drive_item)
         }
     }
 
@@ -230,14 +251,19 @@ impl DriveItem {
                         .overwrite(response.into_body(), Some(md5.clone()))
                         .await?;
                     let duration = start.elapsed();
-                    println!("{}: {:.2}s", disk_item, duration.as_secs_f64());
+                    println!(
+                        "{}: download to {}: {:.2}s",
+                        self,
+                        disk_item,
+                        duration.as_secs_f64()
+                    );
                     Ok(bytes)
                 } else {
-                    println!("{}: would download", disk_item);
+                    println!("{}: download to {}", self, disk_item);
                     Ok(*size as usize)
                 }
             }
-            _ => Err(anyhow!("{}: not a Google Drive file", self.name)),
+            _ => Err(anyhow!("{}: not a Google Drive file", self)),
         }
     }
 
@@ -289,13 +315,18 @@ impl DriveItem {
                     .supports_all_drives(true);
 
                     req.upload_resumable(disk_item.reader()?, mime_type).await?;
-                    println!("{}: {:.2}s", disk_item, start.elapsed().as_secs_f64());
+                    println!(
+                        "{}: update {} :{:.2}s",
+                        self,
+                        disk_item,
+                        start.elapsed().as_secs_f64()
+                    );
                 } else {
-                    println!("{}: would update drive file", disk_item);
+                    println!("{}: update {}", self, disk_item);
                 }
                 Ok(())
             }
-            _ => Err(anyhow!("{}: not a file on Google Drive", self.name)),
+            _ => Err(anyhow!("{}: not a file on Google Drive", self)),
         }
     }
 
@@ -307,11 +338,8 @@ impl DriveItem {
                 .add_scope(google_drive3::api::Scope::Full)
                 .doit()
                 .await?;
-            // TODO: Show the Google Drive path when known.
-            println!("{}: delete existing drive file", self.name);
-        } else {
-            println!("{}: would delete existing drive file", self.name);
         }
+        println!("{}: delete", self);
         Ok(())
     }
 
@@ -339,12 +367,16 @@ impl DriveItem {
                 delegate_config.clone(),
             )
             .await?;
-            let drive_folder = DriveItem::for_drive_file(&file)?;
-            println!("{}: created directory ({})", name, drive_folder);
+            let drive_folder = DriveItem::for_drive_file(&file, &self.path.join(name))?;
+            println!("{}: create directory", self);
             Ok(drive_folder)
         } else {
-            println!("{}: would create drive directory", name);
-            Ok(DriveItem::for_future_dir(name.clone(), self.id.clone()))
+            println!("{}: create directory", self);
+            Ok(DriveItem::for_future_dir(
+                name.clone(),
+                self.id.clone(),
+                &self.path.join(name),
+            ))
         }
     }
 }
@@ -424,6 +456,6 @@ fn get_file_shortcut_details(file: &google_drive3::api::File) -> Result<DriveIte
 
 impl Display for DriveItem {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: parent {:?}", self.id, self.parent)
+        write!(f, "{} ({})", self.path.display(), self.id)
     }
 }

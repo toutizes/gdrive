@@ -247,43 +247,44 @@ impl UploadTask {
         match self.context.options.existing_file_action {
             ExistingDriveFileAction::Skip => {
                 println!(
-                    "{}: exists in Google Drive, skipped. Use --overwrite or --sync to replace",
-                    self.item
+                    "{}: skipped. Exists in Google Drive {}. Use --overwrite or --sync to replace",
+                    self.item, self.existing_items[0],
                 );
                 Ok(())
             }
             ExistingDriveFileAction::Sync | ExistingDriveFileAction::Replace => {
                 if self.existing_items.len() > 1 {
                     println!(
-                        "{}: {} items with the same name on Google Drive, skipped",
+                        "{}: skipped. {} items with the same name on Google Drive: {}, ",
                         self.item,
-                        self.existing_items.len()
+                        self.existing_items.len(),
+                        self.existing_items[0],
                     );
                     return Ok(());
                 }
                 let existing_item = &self.existing_items[0];
                 match &existing_item.details {
                     DriveItemDetails::Root { .. } => {
-                        println!("{}: is a Google Drive root, skipped", self.item);
+                        println!("{}: skipped. Is a Google Drive root", existing_item);
                         Ok(())
                     }
                     DriveItemDetails::Directory { .. } => {
-                        println!("{}: is a folder on Google Drive, skipped", self.item);
+                        println!("{}: is a folder on Google Drive, skipped", existing_item);
                         Ok(())
                     }
                     DriveItemDetails::Shortcut { .. } => {
-                        println!("{}: is a shortcut on Google Drive, skipped", self.item);
+                        println!("{}: is a shortcut on Google Drive, skipped", existing_item);
                         Ok(())
                     }
                     DriveItemDetails::File { md5, .. } => {
                         if self.item.matches_md5(&md5) {
                             println!(
                                 "{}: file already exists and is identical on Google Drive, skipped",
-                                self.item
+                                existing_item
                             );
                             return Ok(());
                         }
-                        println!("{}: updating existing Google Drive file", self.item);
+                        println!("{}: updating existing Google Drive file", existing_item);
                         self.do_update_file(existing_item, self.context.options.dry_run)
                             .await
                     }

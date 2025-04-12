@@ -42,7 +42,7 @@ pub async fn download(
         options: options.clone(),
     };
 
-    let drive_item = DriveItem::for_name(&hub, &drive_path).await?;
+    let drive_item = DriveItem::for_name(&hub, drive_path).await?;
 
     let disk_item = match &destination {
         Some(path) => {
@@ -236,7 +236,7 @@ impl DownloadTask {
     }
 
     async fn download_shortcut(&self, target_id: &String) -> Result<()> {
-        let target_item = DriveItem::for_drive_id(&self.context.hub, target_id).await?;
+        let target_item = DriveItem::for_drive_id(&self.context.hub, &self.drive_item.path, target_id).await?;
         self.context.tm.add_task(DownloadTask::new(
             self.context.clone(),
             target_item,

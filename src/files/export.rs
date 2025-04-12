@@ -32,7 +32,8 @@ pub async fn export(config: Config) -> Result<()> {
         ))?;
     }
 
-    let drive_item = DriveItem::for_drive_id(&hub, &config.file_id).await?;
+    // TODO: find the drive path from the drive id.
+    let drive_item = DriveItem::for_drive_id(&hub, &PathBuf::from(""), &config.file_id).await?;
 
     match &drive_item.details {
         DriveItemDetails::File { mime_type, .. } => {

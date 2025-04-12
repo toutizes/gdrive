@@ -95,10 +95,8 @@ impl DiskItem {
                 if !path.exists() {
                     if !dry_run {
                         fs::create_dir_all(&path)?;
-                        println!("{}: created directory", self);
-                    } else {
-                        println!("{}: would create directory", self);
                     }
+                    println!("{}: create directory", self);
                     Ok(1)
                 } else {
                     let file_type = fs::metadata(&path)?.file_type();
@@ -131,14 +129,12 @@ impl DiskItem {
                         let delete_path = &valid_entry.path();
                         if !dry_run {
                             fs::remove_file(delete_path)?;
-                            println!("{}: deleted", delete_path.display());
-                        } else {
-                            println!("{}: would delete", delete_path.display());
                         }
+                        println!("{}: delete", delete_path.display());
                         n += 1;
                     } else {
                         println!(
-                            "{}: not deleting (not a file or symlink)",
+                            "{}: keep (not a file or symlink)",
                             path.join(entry_name).display(),
                         );
                     }
