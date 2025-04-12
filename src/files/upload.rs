@@ -25,6 +25,7 @@ pub struct UploadOptions {
     pub existing_file_action: ExistingDriveFileAction,
     pub upload_directories: bool,
     pub force_mime_type: Option<Mime>,
+    pub dry_run: bool,
 }
 
 pub async fn upload(
@@ -148,7 +149,12 @@ impl UploadTask {
             let name = self.item.require_name()?;
             let drive_folder = self
                 .dest_parent
-                .mkdir(&self.context.hub, &self.context.delegate_config, &name)
+                .mkdir(
+                    &self.context.hub,
+                    &self.context.delegate_config,
+                    &name,
+                    self.context.options.dry_run,
+                )
                 .await?;
             return self.do_upload_directory(drive_folder, vec![]).await;
         } else if self.existing_items.len() > 1 {
@@ -186,7 +192,6 @@ impl UploadTask {
         // List all the existing drive items.
         let mut drive_item_map: HashMap<String, Vec<DriveItem>> = HashMap::new();
 
-
         for drive_item in &drive_items {
             let name = drive_item.name.clone();
             if let Some(in_map_items) = drive_item_map.get_mut(&name) {
@@ -215,9 +220,9 @@ impl UploadTask {
         if self.context.options.existing_file_action == ExistingDriveFileAction::Sync {
             for drive_item in &drive_items {
                 if !disk_item_set.contains(&drive_item.name) {
-                    // TODO: Show the Google Drive path when known.
-                    println!("{}: deleting existing file", drive_item.name);
-                    drive_item.delete(&self.context.hub).await?;
+                    drive_item
+                        .delete(&self.context.hub, self.context.options.dry_run)
+                        .await?;
                 }
             }
         }
@@ -228,13 +233,13 @@ impl UploadTask {
     // Do some checks before uploading a file.
     async fn maybe_upload_file(&self) -> Result<()> {
         if self.existing_items.is_empty() {
-            println!("{}: uploading to Google Drive", self.item);
             self.dest_parent
                 .upload(
                     &self.context.hub,
                     &self.item,
                     &self.context.options.force_mime_type,
                     self.context.delegate_config.clone(),
+                    self.context.options.dry_run,
                 )
                 .await?;
             return Ok(());
@@ -279,14 +284,15 @@ impl UploadTask {
                             return Ok(());
                         }
                         println!("{}: updating existing Google Drive file", self.item);
-                        self.do_update_file(existing_item).await
+                        self.do_update_file(existing_item, self.context.options.dry_run)
+                            .await
                     }
                 }
             }
         }
     }
 
-    async fn do_update_file(&self, drive_item: &DriveItem) -> Result<()> {
+    async fn do_update_file(&self, drive_item: &DriveItem, dry_run: bool) -> Result<()> {
         match &drive_item.details {
             DriveItemDetails::File { .. } => {
                 _ = &drive_item
@@ -295,6 +301,7 @@ impl UploadTask {
                         &self.item,
                         &None,
                         self.context.delegate_config.clone(),
+                        dry_run,
                     )
                     .await?;
 

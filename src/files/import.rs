@@ -21,9 +21,9 @@ pub async fn import(config: Config) -> Result<()> {
     let parent_item = DriveItem::for_name(&hub, &config.parent).await?;
 
     let drive_item = parent_item
-        .upload(&hub, &disk_item, &None, delegate_config)
+        .upload(&hub, &disk_item, &None, delegate_config, false)
         .await?;
 
-    print!("{}: imported {}", config.file_path.display(), drive_item.id);
+    print!("{}: imported {}", config.file_path.display(), drive_item);
     Ok(())
 }

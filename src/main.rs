@@ -673,6 +673,7 @@ async fn do_it(cli: Cli) -> Result<()> {
                         existing_file_action,
                         upload_directories: recursive,
                         force_mime_type: mime,
+                        dry_run: cli.dry_run,
                     };
                     files::upload(
                         &file_path,

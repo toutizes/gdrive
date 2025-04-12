@@ -60,7 +60,7 @@ pub async fn export(config: Config) -> Result<()> {
         DriveItemDetails::Root {}
         | DriveItemDetails::Directory {}
         | DriveItemDetails::Shortcut { .. } => {
-            Err(anyhow!("{}: not a file on Google Drive", drive_item.id))?;
+            Err(anyhow!("{}: not a file on Google Drive", drive_item))?;
         }
     };
     println!("Successfully exported {}", config.file_path.display());
