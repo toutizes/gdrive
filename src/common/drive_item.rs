@@ -29,10 +29,10 @@ pub enum DriveItemDetails {
 
 #[derive(Debug, Clone)]
 pub struct DriveItem {
-    pub path: PathBuf,      // Manufactured path.
-    pub name: String,       // Empty name for Root
-    id: String,             // Empty id for Root or not created dir
-    parent: Option<String>, // Not really used yet.
+    pub path: PathBuf,       // Manufactured path.
+    pub name: String,        // Empty name for Root
+    id: String,              // Empty id for Root or not created dir
+    _parent: Option<String>, // Not really used yet.
     pub details: DriveItemDetails,
 }
 
@@ -47,7 +47,7 @@ impl DriveItem {
                     id: "<root>".to_string(),
                     name: "".to_string(),
                     path: drive_path.clone(),
-                    parent: None,
+                    _parent: None,
                     details: DriveItemDetails::Root {},
                 })
             }
@@ -68,7 +68,7 @@ impl DriveItem {
             id: "".to_string(),
             name,
             path: path.clone(),
-            parent: Some(parent),
+            _parent: Some(parent),
             details: DriveItemDetails::Directory {},
         }
     }
@@ -78,7 +78,7 @@ impl DriveItem {
             id: "".to_string(),
             name,
             path: path.clone(),
-            parent: Some(parent),
+            _parent: Some(parent),
             details: DriveItemDetails::File {
                 md5: "".to_string(),
                 mime_type: "".to_string(),
@@ -111,7 +111,7 @@ impl DriveItem {
             id: get_file_id(&file)?,
             name: get_file_name(&file)?,
             path: drive_path.clone(),
-            parent: get_file_parent(&file)?,
+            _parent: get_file_parent(&file)?,
             details,
         });
     }
@@ -190,19 +190,15 @@ impl DriveItem {
         }?;
 
         let name = disk_item.require_name()?;
-        let mime_type = if let Some(forced_mime_type) = &force_mime_type {
-            forced_mime_type.clone()
-        } else if let Ok(file_mime_type) = disk_item.mime_type() {
-            file_mime_type
-        } else {
-            mime::APPLICATION_OCTET_STREAM
-        };
 
         if !dry_run {
             let start = Instant::now();
+            let mime_type = force_mime_type
+                .as_ref()
+                .unwrap_or(&disk_item.mime_type()?)
+                .clone();
             let dst_file = google_drive3::api::File {
                 name: Some(name.clone()),
-                mime_type: Some(mime_type.to_string()),
                 parents,
                 ..google_drive3::api::File::default()
             };
@@ -368,15 +364,13 @@ impl DriveItem {
             )
             .await?;
             let drive_folder = DriveItem::for_drive_file(&file, &self.path.join(name))?;
-            println!("{}: create directory", self);
+            println!("{}: create directory", drive_folder);
             Ok(drive_folder)
         } else {
-            println!("{}: create directory", self);
-            Ok(DriveItem::for_future_dir(
-                name.clone(),
-                self.id.clone(),
-                &self.path.join(name),
-            ))
+            let drive_folder =
+                DriveItem::for_future_dir(name.clone(), self.id.clone(), &self.path.join(name));
+            println!("{}: create directory", drive_folder);
+            Ok(drive_folder)
         }
     }
 }

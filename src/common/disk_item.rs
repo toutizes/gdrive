@@ -1,4 +1,3 @@
-use crate::common::drive_file::DocType;
 use crate::common::md5_writer::Md5Writer;
 use anyhow::{anyhow, Result};
 use futures::stream::StreamExt; // for `next()`
@@ -14,8 +13,14 @@ use std::path::PathBuf;
 #[derive(Clone)]
 pub enum DiskItem {
     Stdout {},
-    Root { path: PathBuf },
-    FileOrDir { path: PathBuf, name: String },
+    Root {
+        path: PathBuf,
+    },
+    FileOrDir {
+        path: PathBuf,
+        name: String,
+        mime: Mime,
+    },
 }
 
 impl DiskItem {
@@ -27,9 +32,13 @@ impl DiskItem {
                     if name.is_empty() {
                         panic!("{}: empty basename??", path.display())
                     } else {
+                        let mime = mime_guess::from_path(&path)
+                                .first()
+                                .unwrap_or(mime::APPLICATION_OCTET_STREAM);
                         DiskItem::FileOrDir {
                             path,
                             name: name.clone(),
+                            mime,
                         }
                     }
                 }
@@ -155,11 +164,8 @@ impl DiskItem {
     }
 
     pub fn mime_type(&self) -> Result<Mime> {
-        match self {
-            DiskItem::FileOrDir { path, .. } => DocType::from_file_path(&path)
-                .ok_or(anyhow!("Unsupported file type"))?
-                .mime()
-                .ok_or(anyhow!("Unknown file type")),
+        match &self {
+            DiskItem::FileOrDir { mime, .. } => Ok(mime.clone()),
             _ => Err(anyhow!("<stdout>: no mime type")),
         }
     }
